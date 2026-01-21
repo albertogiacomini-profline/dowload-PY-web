@@ -3,7 +3,7 @@ import json
 import threading
 import time
 import requests
-from queue import Queue
+from queue import Queue, Empty
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template_string
 
@@ -25,6 +25,8 @@ downloading = False
 next_run = None
 MAX_LOG_RECORDS = 10
 LOG_RETENTION_DAYS = 7
+state_lock = threading.Lock()
+data_lock = threading.Lock()
 config = {
     "interval_minutes": 30,
     "max_threads": 3,
@@ -63,20 +65,21 @@ def prune_download_status():
     now = time.time()
     retention_seconds = LOG_RETENTION_DAYS * 24 * 60 * 60
     filtered_items = []
-    for url, meta in download_status.items():
-        finished_at = meta.get("finished_at")
-        if finished_at and now - finished_at > retention_seconds:
-            continue
-        last_seen = finished_at or meta.get("updated_at", now)
-        filtered_items.append((url, meta, last_seen))
+    with state_lock:
+        for url, meta in download_status.items():
+            finished_at = meta.get("finished_at")
+            if finished_at and now - finished_at > retention_seconds:
+                continue
+            last_seen = finished_at or meta.get("updated_at", now)
+            filtered_items.append((url, meta, last_seen))
 
-    filtered_items.sort(key=lambda item: item[2], reverse=True)
-    if len(filtered_items) > MAX_LOG_RECORDS:
-        filtered_items = filtered_items[:MAX_LOG_RECORDS]
+        filtered_items.sort(key=lambda item: item[2], reverse=True)
+        if len(filtered_items) > MAX_LOG_RECORDS:
+            filtered_items = filtered_items[:MAX_LOG_RECORDS]
 
-    download_status.clear()
-    for url, meta, _ in filtered_items:
-        download_status[url] = meta
+        download_status.clear()
+        for url, meta, _ in filtered_items:
+            download_status[url] = meta
 
 
 # ------------------------- CARTELLE -------------------------
@@ -103,12 +106,13 @@ def download_file(url, dest_folder, completed_list):
 
         with requests.get(url, stream=True, verify=False, timeout=30) as r:
             if r.status_code == 404:
-                download_status[url] = {
-                    "speed": "404 Not Found",
-                    "percent": "-",
-                    "updated_at": time.time(),
-                    "finished_at": time.time(),
-                }
+                with state_lock:
+                    download_status[url] = {
+                        "speed": "404 Not Found",
+                        "percent": "-",
+                        "updated_at": time.time(),
+                        "finished_at": time.time(),
+                    }
                 return
             r.raise_for_status()
             total = int(r.headers.get("content-length", 0))
@@ -121,43 +125,53 @@ def download_file(url, dest_folder, completed_list):
                         elapsed = time.time() - start_time
                         speed = downloaded / elapsed / 1024 if elapsed > 0 else 0
                         percent = (downloaded / total * 100) if total > 0 else 0
-                        download_status[url] = {
-                            "speed": f"{speed:.1f} KB/s",
-                            "percent": f"{percent:.1f}%",
-                            "updated_at": time.time(),
-                        }
+                        with state_lock:
+                            download_status[url] = {
+                                "speed": f"{speed:.1f} KB/s",
+                                "percent": f"{percent:.1f}%",
+                                "updated_at": time.time(),
+                            }
 
-        download_status[url] = {
-            "speed": "Completato",
-            "percent": "100%",
-            "updated_at": time.time(),
-            "finished_at": time.time(),
-        }
+        with state_lock:
+            download_status[url] = {
+                "speed": "Completato",
+                "percent": "100%",
+                "updated_at": time.time(),
+                "finished_at": time.time(),
+            }
         completed_list.append(url)
     except Exception as e:
-        download_status[url] = {
-            "speed": f"Errore: {str(e)}",
-            "percent": "-",
-            "updated_at": time.time(),
-            "finished_at": time.time(),
-        }
+        with state_lock:
+            download_status[url] = {
+                "speed": f"Errore: {str(e)}",
+                "percent": "-",
+                "updated_at": time.time(),
+                "finished_at": time.time(),
+            }
 
 
 def worker(queue, completed_list):
-    while not queue.empty():
-        url, dest = queue.get()
-        download_file(url, dest, completed_list)
-        queue.task_done()
+    while True:
+        try:
+            url, dest = queue.get_nowait()
+        except Empty:
+            return
+        try:
+            download_file(url, dest, completed_list)
+        finally:
+            queue.task_done()
 
 
 def run_downloads(force=False):
     global downloading, next_run
-    if downloading:
-        return
-    downloading = True
+    with state_lock:
+        if downloading:
+            return
+        downloading = True
     print(f"[INFO] Avvio ciclo di download {'manuale' if force else 'pianificato'}")
 
-    data = load_json(DATA_FILE, [])
+    with data_lock:
+        data = load_json(DATA_FILE, [])
     queue = Queue()
     completed = []
 
@@ -180,10 +194,12 @@ def run_downloads(force=False):
     if completed:
         print(f"[CLEANUP] Rimuovo {len(completed)} link completati.")
         new_data = [x for x in data if x.get("url") not in completed]
-        save_json(DATA_FILE, new_data)
+        with data_lock:
+            save_json(DATA_FILE, new_data)
 
-    downloading = False
-    next_run = time.time() + config["interval_minutes"] * 60
+    with state_lock:
+        downloading = False
+        next_run = time.time() + config["interval_minutes"] * 60
     print("[INFO] Tutti i download completati.")
 
 
@@ -201,7 +217,8 @@ def daily_cleanup():
         except Exception:
             pass
 
-    data = load_json(DATA_FILE, [])
+    with data_lock:
+        data = load_json(DATA_FILE, [])
     threshold = now - timedelta(days=90)
     cleaned = []
     for item in data:
@@ -219,7 +236,8 @@ def daily_cleanup():
         print(
             f"[CLEANUP] Rimossi {len(data) - len(cleaned)} record vecchi completati (>90 giorni)."
         )
-        save_json(DATA_FILE, cleaned)
+        with data_lock:
+            save_json(DATA_FILE, cleaned)
 
     with open(CLEANUP_FILE, "w") as f:
         f.write(str(now.timestamp()))
@@ -229,11 +247,15 @@ def daily_cleanup():
 
 def background_scheduler():
     global next_run
+    time.sleep(5)
     if not next_run:
-        next_run = time.time() + config["interval_minutes"] * 60
+        with state_lock:
+            next_run = time.time() + config["interval_minutes"] * 60
     while True:
         daily_cleanup()
-        if not downloading and next_run and time.time() >= next_run:
+        with state_lock:
+            should_run = not downloading and next_run and time.time() >= next_run
+        if should_run:
             run_downloads(force=False)
         time.sleep(60)
 
@@ -245,50 +267,60 @@ threading.Thread(target=background_scheduler, daemon=True).start()
 
 @app.route("/api/status")
 def api_status():
-    remaining = max(0, int(next_run - time.time())) if next_run else 0
+    with state_lock:
+        remaining = max(0, int(next_run - time.time())) if next_run else 0
+        active = dict(download_status)
+        is_downloading = downloading
     prune_download_status()
     return jsonify(
         {
-            "downloading": downloading,
+            "downloading": is_downloading,
             "next_run": remaining,
-            "active": download_status,
+            "active": active,
         }
     )
 
 
 @app.route("/api/list")
 def api_list():
-    return jsonify(load_json(DATA_FILE, []))
+    with data_lock:
+        return jsonify(load_json(DATA_FILE, []))
 
 
 @app.route("/api/add", methods=["POST"])
 def api_add():
-    data = load_json(DATA_FILE, [])
+    with data_lock:
+        data = load_json(DATA_FILE, [])
     new_item = request.json
     new_item["date"] = datetime.now().strftime("%b/%y")
     data.append(new_item)
-    save_json(DATA_FILE, data)
+    with data_lock:
+        save_json(DATA_FILE, data)
     return jsonify({"ok": True})
 
 
 @app.route("/api/delete", methods=["POST"])
 def api_delete():
     index = request.json.get("index")
-    data = load_json(DATA_FILE, [])
+    with data_lock:
+        data = load_json(DATA_FILE, [])
     if 0 <= index < len(data):
         del data[index]
-    save_json(DATA_FILE, data)
+    with data_lock:
+        save_json(DATA_FILE, data)
     return jsonify({"ok": True})
 
 
 @app.route("/api/update", methods=["POST"])
 def api_update():
     i = request.json.get("index")
-    data = load_json(DATA_FILE, [])
+    with data_lock:
+        data = load_json(DATA_FILE, [])
     if 0 <= i < len(data):
         data[i]["url"] = request.json.get("url")
         data[i]["subfolder"] = request.json.get("subfolder")
-    save_json(DATA_FILE, data)
+    with data_lock:
+        save_json(DATA_FILE, data)
     return jsonify({"ok": True})
 
 
