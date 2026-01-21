@@ -23,6 +23,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 download_status = {}
 downloading = False
 next_run = None
+MAX_LOG_RECORDS = 10
+LOG_RETENTION_DAYS = 7
 config = {
     "interval_minutes": 30,
     "max_threads": 3,
@@ -57,6 +59,26 @@ def save_config():
     save_json(CONFIG_FILE, config)
 
 
+def prune_download_status():
+    now = time.time()
+    retention_seconds = LOG_RETENTION_DAYS * 24 * 60 * 60
+    filtered_items = []
+    for url, meta in download_status.items():
+        finished_at = meta.get("finished_at")
+        if finished_at and now - finished_at > retention_seconds:
+            continue
+        last_seen = finished_at or meta.get("updated_at", now)
+        filtered_items.append((url, meta, last_seen))
+
+    filtered_items.sort(key=lambda item: item[2], reverse=True)
+    if len(filtered_items) > MAX_LOG_RECORDS:
+        filtered_items = filtered_items[:MAX_LOG_RECORDS]
+
+    download_status.clear()
+    for url, meta, _ in filtered_items:
+        download_status[url] = meta
+
+
 # ------------------------- CARTELLE -------------------------
 
 def list_subfolders(base):
@@ -81,7 +103,12 @@ def download_file(url, dest_folder, completed_list):
 
         with requests.get(url, stream=True, verify=False, timeout=30) as r:
             if r.status_code == 404:
-                download_status[url] = {"speed": "404 Not Found", "percent": "-"}
+                download_status[url] = {
+                    "speed": "404 Not Found",
+                    "percent": "-",
+                    "updated_at": time.time(),
+                    "finished_at": time.time(),
+                }
                 return
             r.raise_for_status()
             total = int(r.headers.get("content-length", 0))
@@ -97,12 +124,23 @@ def download_file(url, dest_folder, completed_list):
                         download_status[url] = {
                             "speed": f"{speed:.1f} KB/s",
                             "percent": f"{percent:.1f}%",
+                            "updated_at": time.time(),
                         }
 
-        download_status[url] = {"speed": "Completato", "percent": "100%"}
+        download_status[url] = {
+            "speed": "Completato",
+            "percent": "100%",
+            "updated_at": time.time(),
+            "finished_at": time.time(),
+        }
         completed_list.append(url)
     except Exception as e:
-        download_status[url] = {"speed": f"Errore: {str(e)}", "percent": "-"}
+        download_status[url] = {
+            "speed": f"Errore: {str(e)}",
+            "percent": "-",
+            "updated_at": time.time(),
+            "finished_at": time.time(),
+        }
 
 
 def worker(queue, completed_list):
@@ -208,6 +246,7 @@ threading.Thread(target=background_scheduler, daemon=True).start()
 @app.route("/api/status")
 def api_status():
     remaining = max(0, int(next_run - time.time())) if next_run else 0
+    prune_download_status()
     return jsonify(
         {
             "downloading": downloading,
@@ -292,7 +331,7 @@ def home():
       th { text-align:left; color:#bbb; font-weight:600; }
       input,select { background:#1b1b1b; color:#fff; border:1px solid #444; padding:6px 8px; border-radius:6px; }
       input:focus { outline: none; border-color:#666; }
-      #overlay,#configOverlay { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); display:none; align-items:center; justify-content:center; }
+      #overlay,#configOverlay { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); display:none; align-items:center; justify-content:center; z-index:100; }
       .modal { background:#1f1f1f; padding:20px; border-radius:10px; min-width: 520px; max-width: 90vw; }
       .row { display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
       #statusBox { line-height:1.5; }
