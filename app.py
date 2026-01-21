@@ -2,6 +2,8 @@ import os
 import json
 import threading
 import time
+import posixpath
+from urllib.parse import urlparse
 import requests
 from queue import Queue, Empty
 from datetime import datetime, timedelta
@@ -11,7 +13,7 @@ app = Flask(__name__)
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DOWNLOADER_DATA_DIR", os.path.join(REPO_ROOT, "data"))
-BASE_PATH = os.environ.get("DOWNLOADER_BASE_PATH", "/volume1/ANIME")
+BASE_PATH = os.environ.get("DOWNLOADER_BASE_PATH")
 DATA_FILE = os.environ.get("DOWNLOADER_DATA_FILE", os.path.join(DATA_DIR, "lista.json"))
 CONFIG_FILE = os.environ.get("DOWNLOADER_CONFIG_FILE", os.path.join(DATA_DIR, "config.json"))
 CLEANUP_FILE = os.environ.get(
@@ -30,6 +32,10 @@ data_lock = threading.Lock()
 config = {
     "interval_minutes": 30,
     "max_threads": 3,
+    "base_path": os.path.join(DATA_DIR, "downloads"),
+    "smb_username": "",
+    "smb_password": "",
+    "smb_domain": "",
 }
 
 
@@ -61,6 +67,39 @@ def save_config():
     save_json(CONFIG_FILE, config)
 
 
+def get_base_path():
+    if BASE_PATH:
+        return BASE_PATH
+    return config.get("base_path", os.path.join(DATA_DIR, "downloads"))
+
+
+def is_smb_path(path):
+    return isinstance(path, str) and path.lower().startswith("smb://")
+
+
+def ensure_smb_session(base_path):
+    import smbclient
+
+    parsed = urlparse(base_path)
+    server = parsed.hostname or parsed.netloc
+    if not server:
+        return
+    smbclient.register_session(
+        server,
+        username=config.get("smb_username") or None,
+        password=config.get("smb_password") or None,
+        domain=config.get("smb_domain") or None,
+    )
+
+
+def join_paths(base_path, subfolder):
+    if not subfolder:
+        return base_path
+    if is_smb_path(base_path):
+        return posixpath.join(base_path.rstrip("/"), subfolder.lstrip("/"))
+    return os.path.join(base_path, subfolder)
+
+
 def prune_download_status():
     now = time.time()
     retention_seconds = LOG_RETENTION_DAYS * 24 * 60 * 60
@@ -86,13 +125,26 @@ def prune_download_status():
 
 def list_subfolders(base):
     folders = []
-    for root, dirs, files in os.walk(base):
-        # Filtra cartelle nascoste o di sistema
-        dirs[:] = [d for d in dirs if not d.startswith(".") and "@eaDir" not in d]
-        for d in dirs:
-            full_path = os.path.relpath(os.path.join(root, d), base)
-            if not any(x in full_path for x in ["@eaDir", "/."]):
-                folders.append(full_path)
+    try:
+        if is_smb_path(base):
+            ensure_smb_session(base)
+            import smbclient
+
+            walker = smbclient.walk(base)
+        else:
+            walker = os.walk(base)
+        for root, dirs, files in walker:
+            # Filtra cartelle nascoste o di sistema
+            dirs[:] = [d for d in dirs if not d.startswith(".") and "@eaDir" not in d]
+            for d in dirs:
+                if is_smb_path(base):
+                    full_path = posixpath.relpath(posixpath.join(root, d), base)
+                else:
+                    full_path = os.path.relpath(os.path.join(root, d), base)
+                if not any(x in full_path for x in ["@eaDir", "/."]):
+                    folders.append(full_path)
+    except Exception:
+        return []
     return sorted(list(set(folders)))
 
 
@@ -100,8 +152,18 @@ def list_subfolders(base):
 
 def download_file(url, dest_folder, completed_list):
     try:
-        os.makedirs(dest_folder, exist_ok=True)
-        local_filename = os.path.join(dest_folder, url.split("/")[-1])
+        file_name = url.split("/")[-1]
+        if is_smb_path(dest_folder):
+            ensure_smb_session(dest_folder)
+            import smbclient
+
+            smbclient.makedirs(dest_folder, exist_ok=True)
+            local_filename = posixpath.join(dest_folder.rstrip("/"), file_name)
+            file_handle = smbclient.open_file(local_filename, mode="wb")
+        else:
+            os.makedirs(dest_folder, exist_ok=True)
+            local_filename = os.path.join(dest_folder, file_name)
+            file_handle = open(local_filename, "wb")
         start_time = time.time()
 
         with requests.get(url, stream=True, verify=False, timeout=30) as r:
@@ -117,7 +179,7 @@ def download_file(url, dest_folder, completed_list):
             r.raise_for_status()
             total = int(r.headers.get("content-length", 0))
             downloaded = 0
-            with open(local_filename, "wb") as f:
+            with file_handle as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
@@ -175,10 +237,11 @@ def run_downloads(force=False):
     queue = Queue()
     completed = []
 
+    base_path = get_base_path()
     for item in data:
         url = item.get("url")
         subfolder = item.get("subfolder", "")
-        folder_path = os.path.join(BASE_PATH, subfolder)
+        folder_path = join_paths(base_path, subfolder)
         queue.put((url, folder_path))
 
     threads = []
@@ -336,9 +399,15 @@ def api_config():
         body = request.json
         config["interval_minutes"] = body.get("interval_minutes", config["interval_minutes"])
         config["max_threads"] = body.get("max_threads", config["max_threads"])
+        config["base_path"] = body.get("base_path", config["base_path"])
+        config["smb_username"] = body.get("smb_username", config["smb_username"])
+        config["smb_password"] = body.get("smb_password", config["smb_password"])
+        config["smb_domain"] = body.get("smb_domain", config["smb_domain"])
         save_config()
         return jsonify({"ok": True})
-    return jsonify(config)
+    response = dict(config)
+    response["base_path"] = get_base_path()
+    return jsonify(response)
 
 
 # ------------------------- UI -------------------------
@@ -346,7 +415,8 @@ def api_config():
 @app.route("/")
 def home():
     data = load_json(DATA_FILE, [])
-    folders = list_subfolders(BASE_PATH)
+    base_path = get_base_path()
+    folders = list_subfolders(base_path)
     html = """
     <html><head>
     <title>Downloader UI</title>
@@ -426,6 +496,23 @@ def home():
       <div class="row" style="margin-top:10px;">
         <label>Thread max:</label>
         <input id="threads" type="number" min="1" max="10" style="width:120px">
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <label>Cartella base:</label>
+        <input id="basePath" type="text" style="min-width:320px;">
+      </div>
+      <div class="muted" style="margin-top:6px;">Supporta percorsi locali o SMB (es: smb://server/condivisione/cartella).</div>
+      <div class="row" style="margin-top:10px;">
+        <label>SMB utente:</label>
+        <input id="smbUser" type="text" style="min-width:220px;">
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <label>SMB password:</label>
+        <input id="smbPass" type="password" style="min-width:220px;">
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <label>SMB dominio:</label>
+        <input id="smbDomain" type="text" style="min-width:220px;">
       </div>
       <div style="margin-top:16px;" class="btn-row">
         <button class="btn" onclick="saveConfig()">Salva</button>
@@ -569,16 +656,31 @@ def home():
       fetch('/api/config').then(r=>r.json()).then(cfg=>{
         document.getElementById('interval').value = cfg.interval_minutes;
         document.getElementById('threads').value = cfg.max_threads;
+        document.getElementById('basePath').value = cfg.base_path || '';
+        document.getElementById('smbUser').value = cfg.smb_username || '';
+        document.getElementById('smbPass').value = cfg.smb_password || '';
+        document.getElementById('smbDomain').value = cfg.smb_domain || '';
         document.getElementById('configOverlay').style.display = 'flex';
       });
     }
     async function saveConfig(){
       const interval = parseInt(document.getElementById('interval').value);
       const threads = parseInt(document.getElementById('threads').value);
+      const basePath = document.getElementById('basePath').value.trim();
+      const smbUser = document.getElementById('smbUser').value.trim();
+      const smbPass = document.getElementById('smbPass').value;
+      const smbDomain = document.getElementById('smbDomain').value.trim();
       await fetch('/api/config',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({interval_minutes:interval, max_threads:threads})
+        body:JSON.stringify({
+          interval_minutes:interval,
+          max_threads:threads,
+          base_path:basePath,
+          smb_username:smbUser,
+          smb_password:smbPass,
+          smb_domain:smbDomain
+        })
       });
       closeConfig();
     }
@@ -590,7 +692,7 @@ def home():
     </script>
     </body></html>
     """
-    return render_template_string(html, data=data, folders=folders, base=BASE_PATH)
+    return render_template_string(html, data=data, folders=folders, base=base_path)
 
 
 # ------------------------- MAIN -------------------------
