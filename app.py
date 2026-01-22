@@ -21,6 +21,9 @@ CONFIG_FILE = os.environ.get("DOWNLOADER_CONFIG_FILE", os.path.join(DATA_DIR, "c
 CLEANUP_FILE = os.environ.get(
     "DOWNLOADER_CLEANUP_FILE", os.path.join(DATA_DIR, "cleanup.timestamp")
 )
+FOLDERS_CACHE_FILE = os.environ.get(
+    "DOWNLOADER_FOLDERS_CACHE_FILE", os.path.join(DATA_DIR, "folders_cache.json")
+)
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -38,9 +41,17 @@ config = {
     "smb_username": "",
     "smb_password": "",
     "smb_share": "",
+    "folder_refresh_minutes": 30,
     "login_username": "admin",
     "login_password": "admin",
 }
+
+folder_cache = {
+    "folders": [],
+    "source": "local",
+    "updated_at": None,
+}
+folder_cache_lock = threading.Lock()
 
 
 # ------------------------- UTILITÀ -------------------------
@@ -69,6 +80,19 @@ def load_config():
 
 def save_config():
     save_json(CONFIG_FILE, config)
+
+
+def load_folder_cache():
+    global folder_cache
+    cached = load_json(FOLDERS_CACHE_FILE, folder_cache)
+    with folder_cache_lock:
+        folder_cache.update(cached)
+
+
+def save_folder_cache():
+    with folder_cache_lock:
+        payload = dict(folder_cache)
+    save_json(FOLDERS_CACHE_FILE, payload)
 
 
 def prune_download_status():
@@ -202,6 +226,38 @@ def list_smb_subfolders(
         return []
     finally:
         conn.close()
+
+
+def scan_folders():
+    smb_cfg = get_smb_config()
+    if smb_cfg["host"] and smb_cfg["username"] and smb_cfg["share"]:
+        print("[FOLDERS] Scansione cache via SMB.")
+        folders = list_smb_subfolders(
+            smb_cfg["host"],
+            smb_cfg["username"],
+            smb_cfg["password"],
+            smb_cfg["share"],
+        )
+        source = "smb"
+    else:
+        print("[FOLDERS] Scansione cache locale.")
+        folders = list_subfolders(BASE_PATH)
+        source = "local"
+    now = time.time()
+    with folder_cache_lock:
+        folder_cache["folders"] = folders
+        folder_cache["source"] = source
+        folder_cache["updated_at"] = now
+    save_folder_cache()
+    preview = ", ".join(folders[:5])
+    print(f"[FOLDERS] Cache aggiornata ({source}): {len(folders)} cartelle. Prime: {preview}")
+
+
+def folder_cache_scheduler():
+    while True:
+        interval = max(1, int(config.get("folder_refresh_minutes", 30)))
+        time.sleep(interval * 60)
+        scan_folders()
 
 
 def ensure_smb_dirs(conn, share, directory):
@@ -428,8 +484,8 @@ def background_scheduler():
             run_downloads(force=False)
         time.sleep(60)
 
-
 threading.Thread(target=background_scheduler, daemon=True).start()
+threading.Thread(target=folder_cache_scheduler, daemon=True).start()
 
 
 @app.before_request
@@ -520,9 +576,13 @@ def api_config():
         config["smb_username"] = body.get("smb_username", config["smb_username"])
         config["smb_password"] = body.get("smb_password", config["smb_password"])
         config["smb_share"] = body.get("smb_share", config["smb_share"])
+        config["folder_refresh_minutes"] = body.get(
+            "folder_refresh_minutes", config["folder_refresh_minutes"]
+        )
         config["login_username"] = body.get("login_username", config["login_username"])
         config["login_password"] = body.get("login_password", config["login_password"])
         save_config()
+        threading.Thread(target=scan_folders, daemon=True).start()
         return jsonify({"ok": True})
     return jsonify(config)
 
@@ -539,21 +599,17 @@ def api_smb_shares():
 
 @app.route("/api/folders")
 def api_folders():
-    smb_cfg = get_smb_config()
-    if smb_cfg["host"] and smb_cfg["username"] and smb_cfg["share"]:
-        print("[FOLDERS] Richiesta cartelle via SMB.")
-        folders = list_smb_subfolders(
-            smb_cfg["host"],
-            smb_cfg["username"],
-            smb_cfg["password"],
-            smb_cfg["share"],
-        )
-    else:
-        print("[FOLDERS] Richiesta cartelle locali.")
-        folders = list_subfolders(BASE_PATH)
-    preview = ", ".join(folders[:5])
-    print(f"[FOLDERS] Restituite {len(folders)} cartelle. Prime: {preview}")
-    return jsonify({"folders": folders})
+    with folder_cache_lock:
+        cached = list(folder_cache.get("folders", []))
+        source = folder_cache.get("source", "local")
+        updated_at = folder_cache.get("updated_at")
+    preview = ", ".join(cached[:5])
+    print(
+        "[FOLDERS] Restituite cartelle da cache:",
+        f"source={source} count={len(cached)} updated_at={updated_at}",
+    )
+    print(f"[FOLDERS] Prime in cache: {preview}")
+    return jsonify({"folders": cached, "updated_at": updated_at, "source": source})
 
 
 # ------------------------- UI -------------------------
@@ -672,6 +728,10 @@ def home():
       <div class="row" style="margin-top:10px;">
         <label>Thread max:</label>
         <input id="threads" type="number" min="1" max="10" style="width:120px">
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <label>Aggiorna cartelle (minuti):</label>
+        <input id="folderRefresh" type="number" min="1" style="width:120px">
       </div>
       <div style="margin-top:16px;" class="btn-row">
         <button class="btn" onclick="saveConfig()">Salva</button>
@@ -822,6 +882,7 @@ def home():
         document.getElementById('smbPass').value = cfg.smb_password || '';
         document.getElementById('loginUser').value = cfg.login_username || '';
         document.getElementById('loginPass').value = cfg.login_password || '';
+        document.getElementById('folderRefresh').value = cfg.folder_refresh_minutes || 30;
         refreshShares(cfg.smb_share || '');
         document.getElementById('configOverlay').style.display = 'flex';
       });
@@ -829,6 +890,7 @@ def home():
     async function saveConfig(){
       const interval = parseInt(document.getElementById('interval').value);
       const threads = parseInt(document.getElementById('threads').value);
+      const folderRefresh = parseInt(document.getElementById('folderRefresh').value);
       const smbHost = document.getElementById('smbHost').value.trim();
       const smbUser = document.getElementById('smbUser').value.trim();
       const smbPass = document.getElementById('smbPass').value;
@@ -841,6 +903,7 @@ def home():
         body:JSON.stringify({
           interval_minutes:interval,
           max_threads:threads,
+          folder_refresh_minutes:folderRefresh,
           smb_host:smbHost,
           smb_username:smbUser,
           smb_password:smbPass,
@@ -992,4 +1055,6 @@ def logout():
 
 if __name__ == "__main__":
     load_config()
+    load_folder_cache()
+    threading.Thread(target=scan_folders, daemon=True).start()
     app.run(host="0.0.0.0", port=8080)
