@@ -146,7 +146,14 @@ def list_smb_shares(host, username, password):
         conn.close()
 
 
-def list_smb_subfolders(host, username, password, share, max_depth=2):
+def list_smb_subfolders(
+    host,
+    username,
+    password,
+    share,
+    max_depth=2,
+    max_scan_folders=500,
+):
     if not share:
         return []
     print(
@@ -158,6 +165,7 @@ def list_smb_subfolders(host, username, password, share, max_depth=2):
         print(f"[FOLDERS] Errore connessione SMB: {err}")
         return []
     folders = []
+    scanned = 0
     queue = [("", 0)]
     try:
         while queue:
@@ -186,6 +194,14 @@ def list_smb_subfolders(host, username, password, share, max_depth=2):
                 rel = f"{current}/{name}" if current else name
                 folders.append(rel)
                 queue.append((rel, depth + 1))
+                scanned += 1
+                if scanned >= max_scan_folders:
+                    print(
+                        "[FOLDERS] Limite cartelle SMB raggiunto:",
+                        f"{max_scan_folders}. Interrompo la scansione.",
+                    )
+                    queue.clear()
+                    break
         unique = sorted(set(folders))
         print(f"[FOLDERS] Trovate {len(unique)} cartelle SMB.")
         if not unique:
