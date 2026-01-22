@@ -3,9 +3,12 @@ import json
 import threading
 import time
 import requests
+import socket
 from queue import Queue, Empty
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template_string
+
+from smb.SMBConnection import SMBConnection
 
 app = Flask(__name__)
 
@@ -30,6 +33,10 @@ data_lock = threading.Lock()
 config = {
     "interval_minutes": 30,
     "max_threads": 3,
+    "smb_host": "",
+    "smb_username": "",
+    "smb_password": "",
+    "smb_share": "",
 }
 
 
@@ -96,11 +103,101 @@ def list_subfolders(base):
     return sorted(list(set(folders)))
 
 
+def create_smb_connection(host, username, password):
+    if not host or not username:
+        return None, "Config SMB incompleta."
+    try:
+        my_name = socket.gethostname()
+        conn = SMBConnection(
+            username,
+            password,
+            my_name,
+            host,
+            use_ntlm_v2=True,
+            is_direct_tcp=True,
+        )
+        if not conn.connect(host, 445, timeout=10):
+            return None, "Connessione SMB fallita."
+        return conn, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def list_smb_shares(host, username, password):
+    conn, err = create_smb_connection(host, username, password)
+    if err or not conn:
+        return [], err
+    try:
+        shares = []
+        for share in conn.listShares():
+            if share.isSpecial:
+                continue
+            if share.type != 0:
+                continue
+            shares.append(share.name)
+        return sorted(shares), None
+    finally:
+        conn.close()
+
+
+def list_smb_subfolders(host, username, password, share, max_depth=5):
+    if not share:
+        return []
+    conn, err = create_smb_connection(host, username, password)
+    if err or not conn:
+        return []
+    folders = []
+    queue = [("", 0)]
+    try:
+        while queue:
+            current, depth = queue.pop(0)
+            if depth > max_depth:
+                continue
+            path = f"/{current}" if current else "/"
+            for entry in conn.listPath(share, path):
+                name = entry.filename
+                if name in (".", "..") or name.startswith("."):
+                    continue
+                if not entry.isDirectory:
+                    continue
+                rel = f"{current}/{name}" if current else name
+                folders.append(rel)
+                queue.append((rel, depth + 1))
+        return sorted(set(folders))
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def ensure_smb_dirs(conn, share, directory):
+    if not directory:
+        return
+    parts = [p for p in directory.split("/") if p]
+    current = ""
+    for part in parts:
+        current = f"{current}/{part}" if current else part
+        try:
+            conn.createDirectory(share, current)
+        except Exception:
+            continue
+
+
+def get_smb_config():
+    return {
+        "host": config.get("smb_host", "").strip(),
+        "username": config.get("smb_username", "").strip(),
+        "password": config.get("smb_password", ""),
+        "share": config.get("smb_share", "").strip(),
+    }
+
+
 # ------------------------- DOWNLOAD -------------------------
 
 def download_file(url, dest_folder, completed_list):
     try:
-        os.makedirs(dest_folder, exist_ok=True)
+        smb_cfg = get_smb_config()
+        use_smb = bool(smb_cfg["host"] and smb_cfg["username"] and smb_cfg["share"])
         local_filename = os.path.join(dest_folder, url.split("/")[-1])
         start_time = time.time()
 
@@ -117,20 +214,45 @@ def download_file(url, dest_folder, completed_list):
             r.raise_for_status()
             total = int(r.headers.get("content-length", 0))
             downloaded = 0
-            with open(local_filename, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        elapsed = time.time() - start_time
-                        speed = downloaded / elapsed / 1024 if elapsed > 0 else 0
-                        percent = (downloaded / total * 100) if total > 0 else 0
-                        with state_lock:
-                            download_status[url] = {
-                                "speed": f"{speed:.1f} KB/s",
-                                "percent": f"{percent:.1f}%",
-                                "updated_at": time.time(),
-                            }
+            if use_smb:
+                conn, err = create_smb_connection(
+                    smb_cfg["host"],
+                    smb_cfg["username"],
+                    smb_cfg["password"],
+                )
+                if err or not conn:
+                    raise RuntimeError(err or "Connessione SMB non disponibile.")
+                with state_lock:
+                    download_status[url] = {
+                        "speed": "In corso",
+                        "percent": "-",
+                        "updated_at": time.time(),
+                    }
+                remote_dir = dest_folder.strip("/")
+                remote_name = url.split("/")[-1]
+                remote_path = (
+                    f"{remote_dir}/{remote_name}" if remote_dir else remote_name
+                )
+                ensure_smb_dirs(conn, smb_cfg["share"], remote_dir)
+                r.raw.decode_content = True
+                conn.storeFile(smb_cfg["share"], remote_path, r.raw)
+                conn.close()
+            else:
+                os.makedirs(dest_folder, exist_ok=True)
+                with open(local_filename, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            elapsed = time.time() - start_time
+                            speed = downloaded / elapsed / 1024 if elapsed > 0 else 0
+                            percent = (downloaded / total * 100) if total > 0 else 0
+                            with state_lock:
+                                download_status[url] = {
+                                    "speed": f"{speed:.1f} KB/s",
+                                    "percent": f"{percent:.1f}%",
+                                    "updated_at": time.time(),
+                                }
 
         with state_lock:
             download_status[url] = {
@@ -178,7 +300,10 @@ def run_downloads(force=False):
     for item in data:
         url = item.get("url")
         subfolder = item.get("subfolder", "")
-        folder_path = os.path.join(BASE_PATH, subfolder)
+        if config.get("smb_share"):
+            folder_path = subfolder
+        else:
+            folder_path = os.path.join(BASE_PATH, subfolder)
         queue.put((url, folder_path))
 
     threads = []
@@ -336,9 +461,38 @@ def api_config():
         body = request.json
         config["interval_minutes"] = body.get("interval_minutes", config["interval_minutes"])
         config["max_threads"] = body.get("max_threads", config["max_threads"])
+        config["smb_host"] = body.get("smb_host", config["smb_host"])
+        config["smb_username"] = body.get("smb_username", config["smb_username"])
+        config["smb_password"] = body.get("smb_password", config["smb_password"])
+        config["smb_share"] = body.get("smb_share", config["smb_share"])
         save_config()
         return jsonify({"ok": True})
     return jsonify(config)
+
+
+@app.route("/api/smb/shares", methods=["POST"])
+def api_smb_shares():
+    body = request.json or {}
+    host = body.get("smb_host", config.get("smb_host", ""))
+    username = body.get("smb_username", config.get("smb_username", ""))
+    password = body.get("smb_password", config.get("smb_password", ""))
+    shares, err = list_smb_shares(host, username, password)
+    return jsonify({"shares": shares, "error": err})
+
+
+@app.route("/api/folders")
+def api_folders():
+    smb_cfg = get_smb_config()
+    if smb_cfg["host"] and smb_cfg["username"] and smb_cfg["share"]:
+        folders = list_smb_subfolders(
+            smb_cfg["host"],
+            smb_cfg["username"],
+            smb_cfg["password"],
+            smb_cfg["share"],
+        )
+    else:
+        folders = list_subfolders(BASE_PATH)
+    return jsonify({"folders": folders})
 
 
 # ------------------------- UI -------------------------
@@ -346,7 +500,7 @@ def api_config():
 @app.route("/")
 def home():
     data = load_json(DATA_FILE, [])
-    folders = list_subfolders(BASE_PATH)
+    base_label = config.get("smb_share") or BASE_PATH
     html = """
     <html><head>
     <title>Downloader UI</title>
@@ -385,17 +539,12 @@ def home():
         <label>URL base:</label>
         <input id="url" size="60" placeholder="...Ep_01_SUB_ITA.mp4">
         <label>Cartella:</label>
-        <input id="subfolder" list="folders" size="40" placeholder="Serie/S01">
+        <select id="subfolder" style="min-width:240px;"></select>
         <label>Numero episodi:</label>
         <input id="episodes" type="number" min="1" value="1" style="width:90px">
         <button class="btn" onclick="add()">Aggiungi</button>
       </div>
-      <div class="muted" style="margin-top:6px;">Suggerimenti cartella presi da {{ base }} (solo directory, niente @eaDir).</div>
-      <datalist id="folders">
-        {% for f in folders %}
-          <option value="{{f}}">
-        {% endfor %}
-      </datalist>
+      <div class="muted" style="margin-top:6px;">Cartella base: {{ base }} (solo directory, niente @eaDir).</div>
     </div>
 
     <div class="section">
@@ -409,7 +558,7 @@ def home():
       <div style="margin:8px 0;">URL:</div>
       <input id="editUrl" size="80">
       <div style="margin:8px 0;">Cartella:</div>
-      <input id="editSub" size="60" list="folders">
+      <select id="editSub" style="min-width:240px;"></select>
       <div style="margin-top:16px;" class="btn-row">
         <button class="btn" onclick="saveEdit()">Salva</button>
         <button class="btn" onclick="closeOverlay()">Annulla</button>
@@ -419,6 +568,23 @@ def home():
     <!-- Modale Config -->
     <div id="configOverlay"><div class="modal">
       <h3>Impostazioni</h3>
+      <div class="row" style="margin-top:10px;">
+        <label>IP/Host SMB:</label>
+        <input id="smbHost" placeholder="192.168.1.10" style="width:200px">
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <label>Utente SMB:</label>
+        <input id="smbUser" placeholder="utente" style="width:200px">
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <label>Password SMB:</label>
+        <input id="smbPass" type="password" placeholder="password" style="width:200px">
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <label>Cartella SMB:</label>
+        <select id="smbShare" style="min-width:240px;"></select>
+        <button class="btn btn-sm" onclick="refreshShares()">Aggiorna</button>
+      </div>
       <div class="row" style="margin-top:10px;">
         <label>Ciclo (minuti):</label>
         <input id="interval" type="number" min="1" style="width:120px">
@@ -513,7 +679,7 @@ def home():
       const sub = (document.getElementById('subfolder').value||'').trim();
       const episodes = parseInt(document.getElementById('episodes').value) || 1;
 
-      if(!url || !sub){ alert("Compila URL e Cartella."); return; }
+      if(!url){ alert("Compila URL."); return; }
 
       const urls = generateEpisodeUrls(url, episodes);
 
@@ -545,7 +711,7 @@ def home():
       if(i<0 || i>=j.length) return;
       editIndex = i;
       document.getElementById('editUrl').value = j[i].url || '';
-      document.getElementById('editSub').value = j[i].subfolder || '';
+      await populateFolderSelect('editSub', j[i].subfolder || '');
       document.getElementById('overlay').style.display = 'flex';
     }
 
@@ -569,28 +735,99 @@ def home():
       fetch('/api/config').then(r=>r.json()).then(cfg=>{
         document.getElementById('interval').value = cfg.interval_minutes;
         document.getElementById('threads').value = cfg.max_threads;
+        document.getElementById('smbHost').value = cfg.smb_host || '';
+        document.getElementById('smbUser').value = cfg.smb_username || '';
+        document.getElementById('smbPass').value = cfg.smb_password || '';
+        refreshShares(cfg.smb_share || '');
         document.getElementById('configOverlay').style.display = 'flex';
       });
     }
     async function saveConfig(){
       const interval = parseInt(document.getElementById('interval').value);
       const threads = parseInt(document.getElementById('threads').value);
+      const smbHost = document.getElementById('smbHost').value.trim();
+      const smbUser = document.getElementById('smbUser').value.trim();
+      const smbPass = document.getElementById('smbPass').value;
+      const smbShare = document.getElementById('smbShare').value;
       await fetch('/api/config',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({interval_minutes:interval, max_threads:threads})
+        body:JSON.stringify({
+          interval_minutes:interval,
+          max_threads:threads,
+          smb_host:smbHost,
+          smb_username:smbUser,
+          smb_password:smbPass,
+          smb_share:smbShare
+        })
       });
       closeConfig();
+      await populateFolderSelect('subfolder');
     }
     function closeConfig(){ document.getElementById('configOverlay').style.display = 'none'; }
 
+    async function refreshShares(selected){
+      const smbHost = document.getElementById('smbHost').value.trim();
+      const smbUser = document.getElementById('smbUser').value.trim();
+      const smbPass = document.getElementById('smbPass').value;
+      const r = await fetch('/api/smb/shares',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({smb_host:smbHost, smb_username:smbUser, smb_password:smbPass})
+      });
+      const j = await r.json();
+      const select = document.getElementById('smbShare');
+      select.innerHTML = '';
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = j.error ? 'Errore SMB' : '-- Seleziona cartella --';
+      select.appendChild(placeholder);
+      (j.shares||[]).forEach(name=>{
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        select.appendChild(opt);
+      });
+      if(selected){
+        select.value = selected;
+      }
+    }
+
+    async function populateFolderSelect(selectId, selectedValue){
+      const r = await fetch('/api/folders');
+      const j = await r.json();
+      const select = document.getElementById(selectId);
+      select.innerHTML = '';
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = '-- Seleziona cartella --';
+      select.appendChild(placeholder);
+      (j.folders||[]).forEach(folder=>{
+        const opt = document.createElement('option');
+        opt.value = folder;
+        opt.textContent = folder;
+        select.appendChild(opt);
+      });
+      if(selectedValue){
+        select.value = selectedValue;
+        if(select.value !== selectedValue){
+          const extra = document.createElement('option');
+          extra.value = selectedValue;
+          extra.textContent = selectedValue;
+          select.appendChild(extra);
+          select.value = selectedValue;
+        }
+      }
+    }
+
     refreshList();
     refreshStatus();
+    populateFolderSelect('subfolder');
     setInterval(refreshStatus, 1000);
     </script>
     </body></html>
     """
-    return render_template_string(html, data=data, folders=folders, base=BASE_PATH)
+    return render_template_string(html, data=data, base=base_label)
 
 
 # ------------------------- MAIN -------------------------
