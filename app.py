@@ -95,6 +95,7 @@ def prune_download_status():
 # ------------------------- CARTELLE -------------------------
 
 def list_subfolders(base):
+    print(f"[FOLDERS] Scansione cartelle locali: base={base}")
     folders = []
     for root, dirs, files in os.walk(base):
         # Filtra cartelle nascoste o di sistema
@@ -103,7 +104,9 @@ def list_subfolders(base):
             full_path = os.path.relpath(os.path.join(root, d), base)
             if not any(x in full_path for x in ["@eaDir", "/."]):
                 folders.append(full_path)
-    return sorted(list(set(folders)))
+    unique = sorted(list(set(folders)))
+    print(f"[FOLDERS] Trovate {len(unique)} cartelle locali.")
+    return unique
 
 
 def create_smb_connection(host, username, password):
@@ -146,8 +149,13 @@ def list_smb_shares(host, username, password):
 def list_smb_subfolders(host, username, password, share, max_depth=5):
     if not share:
         return []
+    print(
+        "[FOLDERS] Scansione cartelle SMB:",
+        f"host={host or '-'} share={share} max_depth={max_depth}",
+    )
     conn, err = create_smb_connection(host, username, password)
     if err or not conn:
+        print(f"[FOLDERS] Errore connessione SMB: {err}")
         return []
     folders = []
     queue = [("", 0)]
@@ -166,8 +174,11 @@ def list_smb_subfolders(host, username, password, share, max_depth=5):
                 rel = f"{current}/{name}" if current else name
                 folders.append(rel)
                 queue.append((rel, depth + 1))
-        return sorted(set(folders))
-    except Exception:
+        unique = sorted(set(folders))
+        print(f"[FOLDERS] Trovate {len(unique)} cartelle SMB.")
+        return unique
+    except Exception as exc:
+        print(f"[FOLDERS] Errore durante la scansione SMB: {exc}")
         return []
     finally:
         conn.close()
@@ -510,6 +521,7 @@ def api_smb_shares():
 def api_folders():
     smb_cfg = get_smb_config()
     if smb_cfg["host"] and smb_cfg["username"] and smb_cfg["share"]:
+        print("[FOLDERS] Richiesta cartelle via SMB.")
         folders = list_smb_subfolders(
             smb_cfg["host"],
             smb_cfg["username"],
@@ -517,7 +529,10 @@ def api_folders():
             smb_cfg["share"],
         )
     else:
+        print("[FOLDERS] Richiesta cartelle locali.")
         folders = list_subfolders(BASE_PATH)
+    preview = ", ".join(folders[:5])
+    print(f"[FOLDERS] Restituite {len(folders)} cartelle. Prime: {preview}")
     return jsonify({"folders": folders})
 
 
