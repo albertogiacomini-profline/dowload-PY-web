@@ -1,0 +1,11 @@
+{
+  "interval_minutes": 30,
+  "max_threads": 3,
+  "smb_host": "192.168.1.103",
+  "smb_username": "jack",
+  "smb_password": "Fiocco22!",
+  "smb_share": "ANIME",
+  "folder_refresh_minutes": 60,
+  "login_username": "admin",
+  "login_password": "admin"
+}
