@@ -548,9 +548,9 @@ def home():
       .row { display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
       #statusBox { line-height:1.5; }
       .muted { color:#999; }
-      .suggestion-wrap { position: relative; display: inline-block; }
-      .suggestions { position:absolute; top:100%; left:0; right:0; background:#1f1f1f; border:1px solid #333; border-radius:6px; margin-top:4px; max-height:220px; overflow:auto; z-index:20; display:none; }
-      .suggestions button { display:block; width:100%; text-align:left; background:none; border:0; color:#ddd; padding:6px 10px; cursor:pointer; }
+      .suggestion-wrap { position: relative; display: inline-block; min-width:240px; }
+      .suggestions { position:absolute; top:100%; left:0; right:0; background:#1f1f1f; border:1px solid #333; border-radius:6px; margin-top:4px; max-height:220px; overflow:auto; z-index:200; display:none; box-shadow:0 6px 14px rgba(0,0,0,0.45); }
+      .suggestions button { display:block; width:100%; text-align:left; background:none; border:0; color:#ddd; padding:6px 10px; cursor:pointer; font-size:13px; }
       .suggestions button:hover { background:#2a2a2a; }
     </style>
     </head><body>
@@ -876,6 +876,9 @@ def home():
       const input = document.getElementById(inputId);
       const suggestBox = document.getElementById(suggestId);
       if(!input || !suggestBox) return;
+      suggestBox.addEventListener('mousedown', (event) => {
+        event.preventDefault();
+      });
       input.addEventListener('input', () => renderSuggestions(inputId, suggestId));
       input.addEventListener('focus', () => renderSuggestions(inputId, suggestId));
       input.addEventListener('blur', () => {
