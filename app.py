@@ -21,6 +21,9 @@ CONFIG_FILE = os.environ.get("DOWNLOADER_CONFIG_FILE", os.path.join(DATA_DIR, "c
 CLEANUP_FILE = os.environ.get(
     "DOWNLOADER_CLEANUP_FILE", os.path.join(DATA_DIR, "cleanup.timestamp")
 )
+FOLDERS_CACHE_FILE = os.environ.get(
+    "DOWNLOADER_FOLDERS_CACHE_FILE", os.path.join(DATA_DIR, "folders_cache.json")
+)
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -38,9 +41,18 @@ config = {
     "smb_username": "",
     "smb_password": "",
     "smb_share": "",
+    "folder_refresh_minutes": 30,
     "login_username": "admin",
     "login_password": "admin",
 }
+
+folder_cache = {
+    "folders": [],
+    "source": "local",
+    "updated_at": None,
+}
+folder_cache_lock = threading.Lock()
+folder_scan_lock = threading.Lock()
 
 
 # ------------------------- UTILITÀ -------------------------
@@ -71,6 +83,19 @@ def save_config():
     save_json(CONFIG_FILE, config)
 
 
+def load_folder_cache():
+    global folder_cache
+    cached = load_json(FOLDERS_CACHE_FILE, folder_cache)
+    with folder_cache_lock:
+        folder_cache.update(cached)
+
+
+def save_folder_cache():
+    with folder_cache_lock:
+        payload = dict(folder_cache)
+    save_json(FOLDERS_CACHE_FILE, payload)
+
+
 def prune_download_status():
     now = time.time()
     retention_seconds = LOG_RETENTION_DAYS * 24 * 60 * 60
@@ -95,6 +120,7 @@ def prune_download_status():
 # ------------------------- CARTELLE -------------------------
 
 def list_subfolders(base):
+    print(f"[FOLDERS] Scansione cartelle locali: base={base}")
     folders = []
     for root, dirs, files in os.walk(base):
         # Filtra cartelle nascoste o di sistema
@@ -103,7 +129,9 @@ def list_subfolders(base):
             full_path = os.path.relpath(os.path.join(root, d), base)
             if not any(x in full_path for x in ["@eaDir", "/."]):
                 folders.append(full_path)
-    return sorted(list(set(folders)))
+    unique = sorted(list(set(folders)))
+    print(f"[FOLDERS] Trovate {len(unique)} cartelle locali.")
+    return unique
 
 
 def create_smb_connection(host, username, password):
@@ -143,21 +171,44 @@ def list_smb_shares(host, username, password):
         conn.close()
 
 
-def list_smb_subfolders(host, username, password, share, max_depth=5):
+def list_smb_subfolders(
+    host,
+    username,
+    password,
+    share,
+    max_depth=2,
+):
     if not share:
         return []
+    print(
+        "[FOLDERS] Scansione cartelle SMB:",
+        f"host={host or '-'} share={share} max_depth={max_depth}",
+    )
     conn, err = create_smb_connection(host, username, password)
     if err or not conn:
+        print(f"[FOLDERS] Errore connessione SMB: {err}")
         return []
     folders = []
     queue = [("", 0)]
     try:
         while queue:
             current, depth = queue.pop(0)
+            if current:
+                print(f"[FOLDERS] SMB scan depth={depth} current='{current}'")
             if depth > max_depth:
                 continue
             path = f"/{current}" if current else "/"
-            for entry in conn.listPath(share, path):
+            try:
+                entries = conn.listPath(share, path)
+            except Exception as exc:
+                print(
+                    "[FOLDERS] Errore listPath SMB:",
+                    f"path={path} err={exc}",
+                )
+                continue
+            if current == "":
+                print(f"[FOLDERS] SMB listPath root entries={len(entries)}")
+            for entry in entries:
                 name = entry.filename
                 if name in (".", "..") or name.startswith("."):
                     continue
@@ -166,11 +217,58 @@ def list_smb_subfolders(host, username, password, share, max_depth=5):
                 rel = f"{current}/{name}" if current else name
                 folders.append(rel)
                 queue.append((rel, depth + 1))
-        return sorted(set(folders))
-    except Exception:
+        unique = sorted(set(folders))
+        print(f"[FOLDERS] Trovate {len(unique)} cartelle SMB.")
+        if not unique:
+            print("[FOLDERS] Nessuna cartella SMB trovata.")
+        return unique
+    except Exception as exc:
+        print(f"[FOLDERS] Errore durante la scansione SMB: {exc}")
         return []
     finally:
         conn.close()
+
+
+def scan_folders():
+    if not folder_scan_lock.acquire(blocking=False):
+        print("[FOLDERS] Scansione già in corso, salto richiesta.")
+        return
+    try:
+        _scan_folders()
+    finally:
+        folder_scan_lock.release()
+
+
+def _scan_folders():
+    smb_cfg = get_smb_config()
+    if smb_cfg["host"] and smb_cfg["username"] and smb_cfg["share"]:
+        print("[FOLDERS] Scansione cache via SMB.")
+        folders = list_smb_subfolders(
+            smb_cfg["host"],
+            smb_cfg["username"],
+            smb_cfg["password"],
+            smb_cfg["share"],
+        )
+        source = "smb"
+    else:
+        print("[FOLDERS] Scansione cache locale.")
+        folders = list_subfolders(BASE_PATH)
+        source = "local"
+    now = time.time()
+    with folder_cache_lock:
+        folder_cache["folders"] = folders
+        folder_cache["source"] = source
+        folder_cache["updated_at"] = now
+    save_folder_cache()
+    preview = ", ".join(folders[:5])
+    print(f"[FOLDERS] Cache aggiornata ({source}): {len(folders)} cartelle. Prime: {preview}")
+
+
+def folder_cache_scheduler():
+    while True:
+        interval = max(1, int(config.get("folder_refresh_minutes", 30)))
+        time.sleep(interval * 60)
+        scan_folders()
 
 
 def ensure_smb_dirs(conn, share, directory):
@@ -397,8 +495,8 @@ def background_scheduler():
             run_downloads(force=False)
         time.sleep(60)
 
-
 threading.Thread(target=background_scheduler, daemon=True).start()
+threading.Thread(target=folder_cache_scheduler, daemon=True).start()
 
 
 @app.before_request
@@ -489,9 +587,13 @@ def api_config():
         config["smb_username"] = body.get("smb_username", config["smb_username"])
         config["smb_password"] = body.get("smb_password", config["smb_password"])
         config["smb_share"] = body.get("smb_share", config["smb_share"])
+        config["folder_refresh_minutes"] = body.get(
+            "folder_refresh_minutes", config["folder_refresh_minutes"]
+        )
         config["login_username"] = body.get("login_username", config["login_username"])
         config["login_password"] = body.get("login_password", config["login_password"])
         save_config()
+        threading.Thread(target=scan_folders, daemon=True).start()
         return jsonify({"ok": True})
     return jsonify(config)
 
@@ -508,17 +610,17 @@ def api_smb_shares():
 
 @app.route("/api/folders")
 def api_folders():
-    smb_cfg = get_smb_config()
-    if smb_cfg["host"] and smb_cfg["username"] and smb_cfg["share"]:
-        folders = list_smb_subfolders(
-            smb_cfg["host"],
-            smb_cfg["username"],
-            smb_cfg["password"],
-            smb_cfg["share"],
-        )
-    else:
-        folders = list_subfolders(BASE_PATH)
-    return jsonify({"folders": folders})
+    with folder_cache_lock:
+        cached = list(folder_cache.get("folders", []))
+        source = folder_cache.get("source", "local")
+        updated_at = folder_cache.get("updated_at")
+    preview = ", ".join(cached[:5])
+    print(
+        "[FOLDERS] Restituite cartelle da cache:",
+        f"source={source} count={len(cached)} updated_at={updated_at}",
+    )
+    print(f"[FOLDERS] Prime in cache: {preview}")
+    return jsonify({"folders": cached, "updated_at": updated_at, "source": source})
 
 
 # ------------------------- UI -------------------------
@@ -571,8 +673,7 @@ def home():
         <input id="url" size="60" placeholder="...Ep_01_SUB_ITA.mp4">
         <label>Cartella:</label>
         <span class="suggestion-wrap">
-          <input id="subfolder" list="subfolderOptions" style="min-width:240px;">
-          <datalist id="subfolderOptions"></datalist>
+          <input id="subfolder" style="min-width:240px;">
           <div id="subfolderSuggest" class="suggestions"></div>
         </span>
         <label>Numero episodi:</label>
@@ -594,8 +695,7 @@ def home():
       <input id="editUrl" size="80">
       <div style="margin:8px 0;">Cartella:</div>
       <span class="suggestion-wrap">
-        <input id="editSub" list="editSubOptions" style="min-width:240px;">
-        <datalist id="editSubOptions"></datalist>
+        <input id="editSub" style="min-width:240px;">
         <div id="editSubSuggest" class="suggestions"></div>
       </span>
       <div style="margin-top:16px;" class="btn-row">
@@ -639,6 +739,10 @@ def home():
       <div class="row" style="margin-top:10px;">
         <label>Thread max:</label>
         <input id="threads" type="number" min="1" max="10" style="width:120px">
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <label>Aggiorna cartelle (minuti):</label>
+        <input id="folderRefresh" type="number" min="1" style="width:120px">
       </div>
       <div style="margin-top:16px;" class="btn-row">
         <button class="btn" onclick="saveConfig()">Salva</button>
@@ -760,7 +864,7 @@ def home():
       if(i<0 || i>=j.length) return;
       editIndex = i;
       document.getElementById('editUrl').value = j[i].url || '';
-      await populateFolderSelect('editSub', 'editSubOptions', j[i].subfolder || '');
+      await populateFolderSelect('editSub', j[i].subfolder || '');
       document.getElementById('overlay').style.display = 'flex';
     }
 
@@ -789,6 +893,7 @@ def home():
         document.getElementById('smbPass').value = cfg.smb_password || '';
         document.getElementById('loginUser').value = cfg.login_username || '';
         document.getElementById('loginPass').value = cfg.login_password || '';
+        document.getElementById('folderRefresh').value = cfg.folder_refresh_minutes || 30;
         refreshShares(cfg.smb_share || '');
         document.getElementById('configOverlay').style.display = 'flex';
       });
@@ -796,6 +901,7 @@ def home():
     async function saveConfig(){
       const interval = parseInt(document.getElementById('interval').value);
       const threads = parseInt(document.getElementById('threads').value);
+      const folderRefresh = parseInt(document.getElementById('folderRefresh').value);
       const smbHost = document.getElementById('smbHost').value.trim();
       const smbUser = document.getElementById('smbUser').value.trim();
       const smbPass = document.getElementById('smbPass').value;
@@ -808,6 +914,7 @@ def home():
         body:JSON.stringify({
           interval_minutes:interval,
           max_threads:threads,
+          folder_refresh_minutes:folderRefresh,
           smb_host:smbHost,
           smb_username:smbUser,
           smb_password:smbPass,
@@ -817,7 +924,7 @@ def home():
         })
       });
       closeConfig();
-      await populateFolderSelect('subfolder', 'subfolderOptions');
+      await populateFolderSelect('subfolder');
     }
     function closeConfig(){ document.getElementById('configOverlay').style.display = 'none'; }
 
@@ -886,17 +993,10 @@ def home():
       });
     }
 
-    async function populateFolderSelect(inputId, listId, selectedValue){
+    async function populateFolderSelect(inputId, selectedValue){
       const r = await fetch('/api/folders');
       const j = await r.json();
       folderSuggestions = j.folders || [];
-      const list = document.getElementById(listId);
-      list.innerHTML = '';
-      folderSuggestions.forEach(folder=>{
-        const opt = document.createElement('option');
-        opt.value = folder;
-        list.appendChild(opt);
-      });
       if(selectedValue){
         const input = document.getElementById(inputId);
         input.value = selectedValue;
@@ -910,7 +1010,7 @@ def home():
 
     refreshList();
     refreshStatus();
-    populateFolderSelect('subfolder', 'subfolderOptions');
+    populateFolderSelect('subfolder');
     setInterval(refreshStatus, 1000);
     </script>
     </body></html>
@@ -966,4 +1066,6 @@ def logout():
 
 if __name__ == "__main__":
     load_config()
+    load_folder_cache()
+    threading.Thread(target=scan_folders, daemon=True).start()
     app.run(host="0.0.0.0", port=8080)
