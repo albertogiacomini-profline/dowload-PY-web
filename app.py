@@ -566,12 +566,13 @@ def home():
         <label>URL base:</label>
         <input id="url" size="60" placeholder="...Ep_01_SUB_ITA.mp4">
         <label>Cartella:</label>
-        <select id="subfolder" style="min-width:240px;"></select>
+        <input id="subfolder" list="subfolderOptions" style="min-width:240px;">
+        <datalist id="subfolderOptions"></datalist>
         <label>Numero episodi:</label>
         <input id="episodes" type="number" min="1" value="1" style="width:90px">
         <button class="btn" onclick="add()">Aggiungi</button>
       </div>
-      <div class="muted" style="margin-top:6px;">Cartella base: {{ base }} (solo directory, niente @eaDir).</div>
+      <div class="muted" style="margin-top:6px;">Suggerimenti cartella presi da {{ base }} (solo directory, niente @eaDir).</div>
     </div>
 
     <div class="section">
@@ -585,7 +586,8 @@ def home():
       <div style="margin:8px 0;">URL:</div>
       <input id="editUrl" size="80">
       <div style="margin:8px 0;">Cartella:</div>
-      <select id="editSub" style="min-width:240px;"></select>
+      <input id="editSub" list="editSubOptions" style="min-width:240px;">
+      <datalist id="editSubOptions"></datalist>
       <div style="margin-top:16px;" class="btn-row">
         <button class="btn" onclick="saveEdit()">Salva</button>
         <button class="btn" onclick="closeOverlay()">Annulla</button>
@@ -746,7 +748,7 @@ def home():
       if(i<0 || i>=j.length) return;
       editIndex = i;
       document.getElementById('editUrl').value = j[i].url || '';
-      await populateFolderSelect('editSub', j[i].subfolder || '');
+      await populateFolderSelect('editSub', 'editSubOptions', j[i].subfolder || '');
       document.getElementById('overlay').style.display = 'flex';
     }
 
@@ -803,7 +805,7 @@ def home():
         })
       });
       closeConfig();
-      await populateFolderSelect('subfolder');
+      await populateFolderSelect('subfolder', 'subfolderOptions');
     }
     function closeConfig(){ document.getElementById('configOverlay').style.display = 'none'; }
 
@@ -834,36 +836,25 @@ def home():
       }
     }
 
-    async function populateFolderSelect(selectId, selectedValue){
+    async function populateFolderSelect(inputId, listId, selectedValue){
       const r = await fetch('/api/folders');
       const j = await r.json();
-      const select = document.getElementById(selectId);
-      select.innerHTML = '';
-      const placeholder = document.createElement('option');
-      placeholder.value = '';
-      placeholder.textContent = '-- Seleziona cartella --';
-      select.appendChild(placeholder);
+      const list = document.getElementById(listId);
+      list.innerHTML = '';
       (j.folders||[]).forEach(folder=>{
         const opt = document.createElement('option');
         opt.value = folder;
-        opt.textContent = folder;
-        select.appendChild(opt);
+        list.appendChild(opt);
       });
       if(selectedValue){
-        select.value = selectedValue;
-        if(select.value !== selectedValue){
-          const extra = document.createElement('option');
-          extra.value = selectedValue;
-          extra.textContent = selectedValue;
-          select.appendChild(extra);
-          select.value = selectedValue;
-        }
+        const input = document.getElementById(inputId);
+        input.value = selectedValue;
       }
     }
 
     refreshList();
     refreshStatus();
-    populateFolderSelect('subfolder');
+    populateFolderSelect('subfolder', 'subfolderOptions');
     setInterval(refreshStatus, 1000);
     </script>
     </body></html>
