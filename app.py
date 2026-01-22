@@ -52,6 +52,7 @@ folder_cache = {
     "updated_at": None,
 }
 folder_cache_lock = threading.Lock()
+folder_scan_lock = threading.Lock()
 
 
 # ------------------------- UTILITÀ -------------------------
@@ -229,6 +230,16 @@ def list_smb_subfolders(
 
 
 def scan_folders():
+    if not folder_scan_lock.acquire(blocking=False):
+        print("[FOLDERS] Scansione già in corso, salto richiesta.")
+        return
+    try:
+        _scan_folders()
+    finally:
+        folder_scan_lock.release()
+
+
+def _scan_folders():
     smb_cfg = get_smb_config()
     if smb_cfg["host"] and smb_cfg["username"] and smb_cfg["share"]:
         print("[FOLDERS] Scansione cache via SMB.")
