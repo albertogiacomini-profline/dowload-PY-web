@@ -548,6 +548,10 @@ def home():
       .row { display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
       #statusBox { line-height:1.5; }
       .muted { color:#999; }
+      .suggestion-wrap { position: relative; display: inline-block; min-width:240px; }
+      .suggestions { position:absolute; top:100%; left:0; right:0; background:#1f1f1f; border:1px solid #333; border-radius:6px; margin-top:4px; max-height:220px; overflow:auto; z-index:200; display:none; box-shadow:0 6px 14px rgba(0,0,0,0.45); }
+      .suggestions button { display:block; width:100%; text-align:left; background:none; border:0; color:#ddd; padding:6px 10px; cursor:pointer; font-size:13px; }
+      .suggestions button:hover { background:#2a2a2a; }
     </style>
     </head><body>
 
@@ -566,12 +570,16 @@ def home():
         <label>URL base:</label>
         <input id="url" size="60" placeholder="...Ep_01_SUB_ITA.mp4">
         <label>Cartella:</label>
-        <select id="subfolder" style="min-width:240px;"></select>
+        <span class="suggestion-wrap">
+          <input id="subfolder" list="subfolderOptions" style="min-width:240px;">
+          <datalist id="subfolderOptions"></datalist>
+          <div id="subfolderSuggest" class="suggestions"></div>
+        </span>
         <label>Numero episodi:</label>
         <input id="episodes" type="number" min="1" value="1" style="width:90px">
         <button class="btn" onclick="add()">Aggiungi</button>
       </div>
-      <div class="muted" style="margin-top:6px;">Cartella base: {{ base }} (solo directory, niente @eaDir).</div>
+      <div class="muted" style="margin-top:6px;">Suggerimenti cartella presi da {{ base }} (solo directory, niente @eaDir).</div>
     </div>
 
     <div class="section">
@@ -585,7 +593,11 @@ def home():
       <div style="margin:8px 0;">URL:</div>
       <input id="editUrl" size="80">
       <div style="margin:8px 0;">Cartella:</div>
-      <select id="editSub" style="min-width:240px;"></select>
+      <span class="suggestion-wrap">
+        <input id="editSub" list="editSubOptions" style="min-width:240px;">
+        <datalist id="editSubOptions"></datalist>
+        <div id="editSubSuggest" class="suggestions"></div>
+      </span>
       <div style="margin-top:16px;" class="btn-row">
         <button class="btn" onclick="saveEdit()">Salva</button>
         <button class="btn" onclick="closeOverlay()">Annulla</button>
@@ -636,6 +648,8 @@ def home():
 
     <script>
     let editIndex = -1;
+    let folderSuggestions = [];
+    const MAX_SUGGESTIONS = 8;
 
     function fileNameFromUrl(u){
       try{ return u.split('/').pop(); } catch(e){ return u; }
@@ -746,7 +760,7 @@ def home():
       if(i<0 || i>=j.length) return;
       editIndex = i;
       document.getElementById('editUrl').value = j[i].url || '';
-      await populateFolderSelect('editSub', j[i].subfolder || '');
+      await populateFolderSelect('editSub', 'editSubOptions', j[i].subfolder || '');
       document.getElementById('overlay').style.display = 'flex';
     }
 
@@ -803,7 +817,7 @@ def home():
         })
       });
       closeConfig();
-      await populateFolderSelect('subfolder');
+      await populateFolderSelect('subfolder', 'subfolderOptions');
     }
     function closeConfig(){ document.getElementById('configOverlay').style.display = 'none'; }
 
@@ -834,36 +848,69 @@ def home():
       }
     }
 
-    async function populateFolderSelect(selectId, selectedValue){
+    function renderSuggestions(inputId, suggestId){
+      const input = document.getElementById(inputId);
+      const suggestBox = document.getElementById(suggestId);
+      const query = (input.value || '').toLowerCase();
+      const matches = folderSuggestions.filter(folder => folder.toLowerCase().includes(query));
+      const limited = matches.slice(0, MAX_SUGGESTIONS);
+      suggestBox.innerHTML = '';
+      if(!limited.length){
+        suggestBox.style.display = 'none';
+        return;
+      }
+      limited.forEach(folder => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = folder;
+        btn.addEventListener('click', () => {
+          input.value = folder;
+          suggestBox.style.display = 'none';
+        });
+        suggestBox.appendChild(btn);
+      });
+      suggestBox.style.display = 'block';
+    }
+
+    function bindSuggestionInput(inputId, suggestId){
+      const input = document.getElementById(inputId);
+      const suggestBox = document.getElementById(suggestId);
+      if(!input || !suggestBox) return;
+      suggestBox.addEventListener('mousedown', (event) => {
+        event.preventDefault();
+      });
+      input.addEventListener('input', () => renderSuggestions(inputId, suggestId));
+      input.addEventListener('focus', () => renderSuggestions(inputId, suggestId));
+      input.addEventListener('blur', () => {
+        setTimeout(() => { suggestBox.style.display = 'none'; }, 150);
+      });
+    }
+
+    async function populateFolderSelect(inputId, listId, selectedValue){
       const r = await fetch('/api/folders');
       const j = await r.json();
-      const select = document.getElementById(selectId);
-      select.innerHTML = '';
-      const placeholder = document.createElement('option');
-      placeholder.value = '';
-      placeholder.textContent = '-- Seleziona cartella --';
-      select.appendChild(placeholder);
-      (j.folders||[]).forEach(folder=>{
+      folderSuggestions = j.folders || [];
+      const list = document.getElementById(listId);
+      list.innerHTML = '';
+      folderSuggestions.forEach(folder=>{
         const opt = document.createElement('option');
         opt.value = folder;
-        opt.textContent = folder;
-        select.appendChild(opt);
+        list.appendChild(opt);
       });
       if(selectedValue){
-        select.value = selectedValue;
-        if(select.value !== selectedValue){
-          const extra = document.createElement('option');
-          extra.value = selectedValue;
-          extra.textContent = selectedValue;
-          select.appendChild(extra);
-          select.value = selectedValue;
-        }
+        const input = document.getElementById(inputId);
+        input.value = selectedValue;
       }
+      renderSuggestions('subfolder', 'subfolderSuggest');
+      renderSuggestions('editSub', 'editSubSuggest');
     }
+
+    bindSuggestionInput('subfolder', 'subfolderSuggest');
+    bindSuggestionInput('editSub', 'editSubSuggest');
 
     refreshList();
     refreshStatus();
-    populateFolderSelect('subfolder');
+    populateFolderSelect('subfolder', 'subfolderOptions');
     setInterval(refreshStatus, 1000);
     </script>
     </body></html>
