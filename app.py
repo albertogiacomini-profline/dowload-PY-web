@@ -3,6 +3,7 @@ import json
 import threading
 import time
 import requests
+import subprocess
 from queue import Queue, Empty
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template_string
@@ -30,6 +31,12 @@ data_lock = threading.Lock()
 config = {
     "interval_minutes": 30,
     "max_threads": 3,
+    "smb_host": "",
+    "smb_share": "",
+    "smb_username": "",
+    "smb_password": "",
+    "smb_domain": "",
+    "smb_port": 445,
 }
 
 
@@ -336,9 +343,71 @@ def api_config():
         body = request.json
         config["interval_minutes"] = body.get("interval_minutes", config["interval_minutes"])
         config["max_threads"] = body.get("max_threads", config["max_threads"])
+        config["smb_host"] = body.get("smb_host", config["smb_host"])
+        config["smb_share"] = body.get("smb_share", config["smb_share"])
+        config["smb_username"] = body.get("smb_username", config["smb_username"])
+        config["smb_password"] = body.get("smb_password", config["smb_password"])
+        config["smb_domain"] = body.get("smb_domain", config["smb_domain"])
+        config["smb_port"] = body.get("smb_port", config["smb_port"])
         save_config()
         return jsonify({"ok": True})
     return jsonify(config)
+
+
+@app.route("/api/smb/test", methods=["POST"])
+def api_smb_test():
+    payload = request.json or {}
+    host = (payload.get("host") or "").strip()
+    share = (payload.get("share") or "").strip()
+    username = (payload.get("username") or "").strip()
+    password = payload.get("password") or ""
+    domain = (payload.get("domain") or "").strip()
+    port = int(payload.get("port") or 445)
+
+    if not host or not share:
+        return jsonify({"ok": False, "message": "Host e share sono obbligatori."})
+
+    if domain and username and "\\" not in username and "@" not in username:
+        username = f"{domain}\\{username}"
+
+    try:
+        cmd = ["smbclient", f"//{host}/{share}", "-c", "ls", "-p", str(port)]
+        if domain:
+            cmd.extend(["-W", domain])
+        if username or password:
+            cmd.extend(["-U", f"{username}%{password}"])
+        else:
+            cmd.append("-N")
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            error_msg = (result.stderr or result.stdout or "").strip()
+            return jsonify(
+                {
+                    "ok": False,
+                    "message": f"Errore: {error_msg or 'test SMB fallito'}",
+                }
+            )
+
+        entries = []
+        for line in result.stdout.splitlines():
+            if not line.startswith("  "):
+                continue
+            name = line.strip().split()[0]
+            if name in {".", ".."}:
+                continue
+            entries.append(line)
+        count = len(entries)
+        message = f"Connessione OK. {count} elementi trovati." if count else "Connessione OK."
+        return jsonify({"ok": True, "message": message})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": f"Errore: {exc}"})
 
 
 # ------------------------- UI -------------------------
@@ -368,6 +437,9 @@ def home():
       .row { display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
       #statusBox { line-height:1.5; }
       .muted { color:#999; }
+      .status-line { margin-top:8px; color:#c9c9c9; }
+      .status-line.ok { color:#6bd16b; }
+      .status-line.err { color:#ff6b6b; }
     </style>
     </head><body>
 
@@ -426,6 +498,29 @@ def home():
       <div class="row" style="margin-top:10px;">
         <label>Thread max:</label>
         <input id="threads" type="number" min="1" max="10" style="width:120px">
+      </div>
+      <div style="margin-top:16px;">
+        <h4>Connessione SMB</h4>
+        <div class="row" style="margin-top:10px;">
+          <label>Host:</label>
+          <input id="smbHost" type="text" style="width:180px" placeholder="server.local">
+          <label>Share:</label>
+          <input id="smbShare" type="text" style="width:180px" placeholder="cartella">
+        </div>
+        <div class="row" style="margin-top:10px;">
+          <label>Dominio:</label>
+          <input id="smbDomain" type="text" style="width:140px" placeholder="WORKGROUP">
+          <label>Utente:</label>
+          <input id="smbUser" type="text" style="width:160px" placeholder="utente">
+          <label>Password:</label>
+          <input id="smbPass" type="password" style="width:180px">
+        </div>
+        <div class="row" style="margin-top:10px;">
+          <label>Porta:</label>
+          <input id="smbPort" type="number" min="1" max="65535" style="width:120px">
+          <button class="btn btn-sm" onclick="testSmb()">Test connessione</button>
+        </div>
+        <div id="smbStatus" class="status-line"></div>
       </div>
       <div style="margin-top:16px;" class="btn-row">
         <button class="btn" onclick="saveConfig()">Salva</button>
@@ -569,18 +664,68 @@ def home():
       fetch('/api/config').then(r=>r.json()).then(cfg=>{
         document.getElementById('interval').value = cfg.interval_minutes;
         document.getElementById('threads').value = cfg.max_threads;
+        document.getElementById('smbHost').value = cfg.smb_host || '';
+        document.getElementById('smbShare').value = cfg.smb_share || '';
+        document.getElementById('smbDomain').value = cfg.smb_domain || '';
+        document.getElementById('smbUser').value = cfg.smb_username || '';
+        document.getElementById('smbPass').value = cfg.smb_password || '';
+        document.getElementById('smbPort').value = cfg.smb_port || 445;
+        document.getElementById('smbStatus').textContent = '';
+        document.getElementById('smbStatus').className = 'status-line';
         document.getElementById('configOverlay').style.display = 'flex';
       });
     }
     async function saveConfig(){
       const interval = parseInt(document.getElementById('interval').value);
       const threads = parseInt(document.getElementById('threads').value);
+      const smb_host = document.getElementById('smbHost').value.trim();
+      const smb_share = document.getElementById('smbShare').value.trim();
+      const smb_domain = document.getElementById('smbDomain').value.trim();
+      const smb_username = document.getElementById('smbUser').value.trim();
+      const smb_password = document.getElementById('smbPass').value;
+      const smb_port = parseInt(document.getElementById('smbPort').value) || 445;
       await fetch('/api/config',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({interval_minutes:interval, max_threads:threads})
+        body:JSON.stringify({
+          interval_minutes:interval,
+          max_threads:threads,
+          smb_host,
+          smb_share,
+          smb_domain,
+          smb_username,
+          smb_password,
+          smb_port
+        })
       });
       closeConfig();
+    }
+
+    async function testSmb(){
+      const payload = {
+        host: document.getElementById('smbHost').value.trim(),
+        share: document.getElementById('smbShare').value.trim(),
+        domain: document.getElementById('smbDomain').value.trim(),
+        username: document.getElementById('smbUser').value.trim(),
+        password: document.getElementById('smbPass').value,
+        port: parseInt(document.getElementById('smbPort').value) || 445
+      };
+      const statusEl = document.getElementById('smbStatus');
+      statusEl.textContent = 'Test in corso...';
+      statusEl.className = 'status-line';
+      try{
+        const r = await fetch('/api/smb/test',{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify(payload)
+        });
+        const j = await r.json();
+        statusEl.textContent = j.message || 'Risposta non valida.';
+        statusEl.className = j.ok ? 'status-line ok' : 'status-line err';
+      }catch(e){
+        statusEl.textContent = 'Errore durante il test.';
+        statusEl.className = 'status-line err';
+      }
     }
     function closeConfig(){ document.getElementById('configOverlay').style.display = 'none'; }
 
