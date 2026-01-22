@@ -109,7 +109,14 @@ def list_subfolders(base):
 
 def download_file(url, dest_folder, completed_list):
     try:
-        os.makedirs(dest_folder, exist_ok=True)
+        if not os.path.exists(dest_folder):
+            try:
+                os.makedirs(dest_folder, exist_ok=True)
+            except OSError as exc:
+                raise OSError(
+                    f"{exc}. Percorso non scrivibile, verifica il mount SMB o "
+                    "configura DOWNLOADER_BASE_PATH."
+                ) from exc
         local_filename = os.path.join(dest_folder, url.split("/")[-1])
         start_time = time.time()
 
