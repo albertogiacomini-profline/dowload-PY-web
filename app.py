@@ -6,11 +6,12 @@ import requests
 import socket
 from queue import Queue, Empty
 from datetime import datetime, timedelta
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, jsonify, request, render_template_string, redirect, url_for, session
 
 from smb.SMBConnection import SMBConnection
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("DOWNLOADER_SECRET_KEY", "change-me")
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DOWNLOADER_DATA_DIR", os.path.join(REPO_ROOT, "data"))
@@ -37,6 +38,8 @@ config = {
     "smb_username": "",
     "smb_password": "",
     "smb_share": "",
+    "login_username": "admin",
+    "login_password": "admin",
 }
 
 
@@ -190,6 +193,16 @@ def get_smb_config():
         "password": config.get("smb_password", ""),
         "share": config.get("smb_share", "").strip(),
     }
+
+
+def is_login_configured():
+    return bool(config.get("login_username") or config.get("login_password"))
+
+
+def is_authenticated():
+    if not is_login_configured():
+        return True
+    return bool(session.get("logged_in"))
 
 
 # ------------------------- DOWNLOAD -------------------------
@@ -388,6 +401,17 @@ def background_scheduler():
 threading.Thread(target=background_scheduler, daemon=True).start()
 
 
+@app.before_request
+def require_login():
+    if request.path in ("/login", "/logout"):
+        return None
+    if request.path.startswith("/static"):
+        return None
+    if not is_authenticated():
+        return redirect(url_for("login", next=request.path))
+    return None
+
+
 # ------------------------- API -------------------------
 
 @app.route("/api/status")
@@ -465,6 +489,8 @@ def api_config():
         config["smb_username"] = body.get("smb_username", config["smb_username"])
         config["smb_password"] = body.get("smb_password", config["smb_password"])
         config["smb_share"] = body.get("smb_share", config["smb_share"])
+        config["login_username"] = body.get("login_username", config["login_username"])
+        config["login_password"] = body.get("login_password", config["login_password"])
         save_config()
         return jsonify({"ok": True})
     return jsonify(config)
@@ -530,6 +556,7 @@ def home():
       <div class="btn-row">
         <button class="btn" onclick="force()">Forza download</button>
         <button class="btn" onclick="openConfig()">Impostazioni</button>
+        <a class="btn" href="/logout">Esci</a>
       </div>
     </div>
 
@@ -579,6 +606,14 @@ def home():
       <div class="row" style="margin-top:10px;">
         <label>Password SMB:</label>
         <input id="smbPass" type="password" placeholder="password" style="width:200px">
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <label>Login utente:</label>
+        <input id="loginUser" placeholder="admin" style="width:200px">
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <label>Login password:</label>
+        <input id="loginPass" type="password" placeholder="password" style="width:200px">
       </div>
       <div class="row" style="margin-top:10px;">
         <label>Cartella SMB:</label>
@@ -738,6 +773,8 @@ def home():
         document.getElementById('smbHost').value = cfg.smb_host || '';
         document.getElementById('smbUser').value = cfg.smb_username || '';
         document.getElementById('smbPass').value = cfg.smb_password || '';
+        document.getElementById('loginUser').value = cfg.login_username || '';
+        document.getElementById('loginPass').value = cfg.login_password || '';
         refreshShares(cfg.smb_share || '');
         document.getElementById('configOverlay').style.display = 'flex';
       });
@@ -748,6 +785,8 @@ def home():
       const smbHost = document.getElementById('smbHost').value.trim();
       const smbUser = document.getElementById('smbUser').value.trim();
       const smbPass = document.getElementById('smbPass').value;
+      const loginUser = document.getElementById('loginUser').value.trim();
+      const loginPass = document.getElementById('loginPass').value;
       const smbShare = document.getElementById('smbShare').value;
       await fetch('/api/config',{
         method:'POST',
@@ -758,7 +797,9 @@ def home():
           smb_host:smbHost,
           smb_username:smbUser,
           smb_password:smbPass,
-          smb_share:smbShare
+          smb_share:smbShare,
+          login_username:loginUser,
+          login_password:loginPass
         })
       });
       closeConfig();
@@ -828,6 +869,50 @@ def home():
     </body></html>
     """
     return render_template_string(html, data=data, base=base_label)
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        if username == config.get("login_username") and password == config.get("login_password"):
+            session["logged_in"] = True
+            next_url = request.args.get("next") or url_for("home")
+            return redirect(next_url)
+        error = "Credenziali non valide."
+    html = """
+    <html><head>
+    <title>Login</title>
+    <style>
+      body { font-family: Arial, Helvetica, sans-serif; background:#111; color:#ddd; margin:0; height:100vh; display:flex; align-items:center; justify-content:center; }
+      .card { background:#1d1d1d; padding:24px; border-radius:12px; min-width:320px; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
+      input { width:100%; margin-top:6px; background:#1b1b1b; color:#fff; border:1px solid #444; padding:8px 10px; border-radius:6px; }
+      label { display:block; margin-top:12px; color:#aaa; font-size:14px; }
+      .btn { margin-top:16px; width:100%; background:#3a3a3a; color:#fff; border:1px solid #555; padding:10px 14px; border-radius:6px; cursor:pointer; }
+      .btn:hover { background:#4a4a4a; }
+      .error { margin-top:12px; color:#ff8b8b; font-size:14px; }
+    </style>
+    </head><body>
+      <form class="card" method="post">
+        <h2>Accedi</h2>
+        <label>Username</label>
+        <input name="username" autocomplete="username" required>
+        <label>Password</label>
+        <input type="password" name="password" autocomplete="current-password" required>
+        <button class="btn" type="submit">Entra</button>
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+      </form>
+    </body></html>
+    """
+    return render_template_string(html, error=error)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 
 # ------------------------- MAIN -------------------------
