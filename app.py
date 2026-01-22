@@ -152,7 +152,6 @@ def list_smb_subfolders(
     password,
     share,
     max_depth=2,
-    max_scan_folders=500,
 ):
     if not share:
         return []
@@ -165,7 +164,6 @@ def list_smb_subfolders(
         print(f"[FOLDERS] Errore connessione SMB: {err}")
         return []
     folders = []
-    scanned = 0
     queue = [("", 0)]
     try:
         while queue:
@@ -194,14 +192,6 @@ def list_smb_subfolders(
                 rel = f"{current}/{name}" if current else name
                 folders.append(rel)
                 queue.append((rel, depth + 1))
-                scanned += 1
-                if scanned >= max_scan_folders:
-                    print(
-                        "[FOLDERS] Limite cartelle SMB raggiunto:",
-                        f"{max_scan_folders}. Interrompo la scansione.",
-                    )
-                    queue.clear()
-                    break
         unique = sorted(set(folders))
         print(f"[FOLDERS] Trovate {len(unique)} cartelle SMB.")
         if not unique:
@@ -616,8 +606,7 @@ def home():
         <input id="url" size="60" placeholder="...Ep_01_SUB_ITA.mp4">
         <label>Cartella:</label>
         <span class="suggestion-wrap">
-          <input id="subfolder" list="subfolderOptions" style="min-width:240px;">
-          <datalist id="subfolderOptions"></datalist>
+          <input id="subfolder" style="min-width:240px;">
           <div id="subfolderSuggest" class="suggestions"></div>
         </span>
         <label>Numero episodi:</label>
@@ -639,8 +628,7 @@ def home():
       <input id="editUrl" size="80">
       <div style="margin:8px 0;">Cartella:</div>
       <span class="suggestion-wrap">
-        <input id="editSub" list="editSubOptions" style="min-width:240px;">
-        <datalist id="editSubOptions"></datalist>
+        <input id="editSub" style="min-width:240px;">
         <div id="editSubSuggest" class="suggestions"></div>
       </span>
       <div style="margin-top:16px;" class="btn-row">
@@ -805,7 +793,7 @@ def home():
       if(i<0 || i>=j.length) return;
       editIndex = i;
       document.getElementById('editUrl').value = j[i].url || '';
-      await populateFolderSelect('editSub', 'editSubOptions', j[i].subfolder || '');
+      await populateFolderSelect('editSub', j[i].subfolder || '');
       document.getElementById('overlay').style.display = 'flex';
     }
 
@@ -862,7 +850,7 @@ def home():
         })
       });
       closeConfig();
-      await populateFolderSelect('subfolder', 'subfolderOptions');
+      await populateFolderSelect('subfolder');
     }
     function closeConfig(){ document.getElementById('configOverlay').style.display = 'none'; }
 
@@ -931,17 +919,10 @@ def home():
       });
     }
 
-    async function populateFolderSelect(inputId, listId, selectedValue){
+    async function populateFolderSelect(inputId, selectedValue){
       const r = await fetch('/api/folders');
       const j = await r.json();
       folderSuggestions = j.folders || [];
-      const list = document.getElementById(listId);
-      list.innerHTML = '';
-      folderSuggestions.forEach(folder=>{
-        const opt = document.createElement('option');
-        opt.value = folder;
-        list.appendChild(opt);
-      });
       if(selectedValue){
         const input = document.getElementById(inputId);
         input.value = selectedValue;
@@ -955,7 +936,7 @@ def home():
 
     refreshList();
     refreshStatus();
-    populateFolderSelect('subfolder', 'subfolderOptions');
+    populateFolderSelect('subfolder');
     setInterval(refreshStatus, 1000);
     </script>
     </body></html>
