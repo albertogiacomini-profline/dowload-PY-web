@@ -3,9 +3,7 @@ import json
 import threading
 import time
 import requests
-import shutil
-import subprocess
-import tempfile
+import socket
 from queue import Queue, Empty
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template_string
@@ -37,7 +35,6 @@ config = {
     "smb_share": "",
     "smb_username": "",
     "smb_password": "",
-    "smb_domain": "",
     "smb_port": 445,
 }
 
@@ -356,7 +353,6 @@ def api_config():
         config["smb_share"] = body.get("smb_share", config["smb_share"])
         config["smb_username"] = body.get("smb_username", config["smb_username"])
         config["smb_password"] = body.get("smb_password", config["smb_password"])
-        config["smb_domain"] = body.get("smb_domain", config["smb_domain"])
         config["smb_port"] = body.get("smb_port", config["smb_port"])
         save_config()
         return jsonify({"ok": True})
@@ -370,76 +366,23 @@ def api_smb_test():
     share = (payload.get("share") or "").strip()
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
-    domain = (payload.get("domain") or "").strip()
     port = int(payload.get("port") or 445)
 
     if not host or not share:
         return jsonify({"ok": False, "message": "Host e share sono obbligatori."})
 
-    if domain and username and "\\" not in username and "@" not in username:
-        username = f"{domain}\\{username}"
-
-    if shutil.which("smbclient") is None:
-        return jsonify(
-            {
-                "ok": False,
-                "message": "Errore: smbclient non trovato. Installa il pacchetto samba-client.",
-            }
-        )
-
-    auth_file = None
     try:
-        cmd = ["smbclient", f"//{host}/{share}", "-c", "ls", "-p", str(port)]
-        if username or password:
-            with tempfile.NamedTemporaryFile("w", delete=False) as handle:
-                auth_file = handle.name
-                if username:
-                    handle.write(f"username={username}\n")
-                if password:
-                    handle.write(f"password={password}\n")
-                if domain:
-                    handle.write(f"domain={domain}\n")
-            cmd.extend(["-A", auth_file])
-        else:
-            cmd.append("-N")
-            if domain:
-                cmd.extend(["-W", domain])
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
+        sock = socket.create_connection((host, port), timeout=5)
+        sock.close()
+        message = (
+            "Connessione OK alla porta SMB. "
+            "Inserisci Host (es. 192.168.1.10) e Share (es. ANIME) per il mount."
         )
-        if result.returncode != 0:
-            error_msg = (result.stderr or result.stdout or "").strip()
-            return jsonify(
-                {
-                    "ok": False,
-                    "message": f"Errore: {error_msg or 'test SMB fallito'}",
-                }
-            )
-
-        entries = []
-        for line in result.stdout.splitlines():
-            if not line.startswith("  "):
-                continue
-            name = line.strip().split()[0]
-            if name in {".", ".."}:
-                continue
-            entries.append(line)
-        count = len(entries)
-        message = f"Connessione OK. {count} elementi trovati." if count else "Connessione OK."
+        if username or password:
+            message += " Credenziali salvate (non verificate in questo test)."
         return jsonify({"ok": True, "message": message})
     except Exception as exc:
         return jsonify({"ok": False, "message": f"Errore: {exc}"})
-    finally:
-        if auth_file:
-            try:
-                os.unlink(auth_file)
-            except OSError:
-                pass
 
 
 # ------------------------- UI -------------------------
@@ -540,8 +483,6 @@ def home():
           <input id="smbShare" type="text" style="width:180px" placeholder="cartella">
         </div>
         <div class="row" style="margin-top:10px;">
-          <label>Dominio:</label>
-          <input id="smbDomain" type="text" style="width:140px" placeholder="WORKGROUP">
           <label>Utente:</label>
           <input id="smbUser" type="text" style="width:160px" placeholder="utente">
           <label>Password:</label>
@@ -551,6 +492,9 @@ def home():
           <label>Porta:</label>
           <input id="smbPort" type="number" min="1" max="65535" style="width:120px">
           <button class="btn btn-sm" onclick="testSmb()">Test connessione</button>
+        </div>
+        <div class="muted" style="margin-top:6px;">
+          Host: IP o nome server (es. 192.168.1.10). Share: nome cartella (es. ANIME), senza prefisso \\\\.
         </div>
         <div id="smbStatus" class="status-line"></div>
       </div>
@@ -698,7 +642,6 @@ def home():
         document.getElementById('threads').value = cfg.max_threads;
         document.getElementById('smbHost').value = cfg.smb_host || '';
         document.getElementById('smbShare').value = cfg.smb_share || '';
-        document.getElementById('smbDomain').value = cfg.smb_domain || '';
         document.getElementById('smbUser').value = cfg.smb_username || '';
         document.getElementById('smbPass').value = cfg.smb_password || '';
         document.getElementById('smbPort').value = cfg.smb_port || 445;
@@ -712,7 +655,6 @@ def home():
       const threads = parseInt(document.getElementById('threads').value);
       const smb_host = document.getElementById('smbHost').value.trim();
       const smb_share = document.getElementById('smbShare').value.trim();
-      const smb_domain = document.getElementById('smbDomain').value.trim();
       const smb_username = document.getElementById('smbUser').value.trim();
       const smb_password = document.getElementById('smbPass').value;
       const smb_port = parseInt(document.getElementById('smbPort').value) || 445;
@@ -724,7 +666,6 @@ def home():
           max_threads:threads,
           smb_host,
           smb_share,
-          smb_domain,
           smb_username,
           smb_password,
           smb_port
@@ -737,7 +678,6 @@ def home():
       const payload = {
         host: document.getElementById('smbHost').value.trim(),
         share: document.getElementById('smbShare').value.trim(),
-        domain: document.getElementById('smbDomain').value.trim(),
         username: document.getElementById('smbUser').value.trim(),
         password: document.getElementById('smbPass').value,
         port: parseInt(document.getElementById('smbPort').value) || 445
