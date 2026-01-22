@@ -834,10 +834,19 @@ def home():
       }
     }
 
+    function getStoredFolder(){
+      return window.localStorage.getItem('lastSubfolder') || '';
+    }
+
+    function setStoredFolder(value){
+      window.localStorage.setItem('lastSubfolder', value || '');
+    }
+
     async function populateFolderSelect(selectId, selectedValue){
       const r = await fetch('/api/folders');
       const j = await r.json();
       const select = document.getElementById(selectId);
+      const previousValue = select.value;
       select.innerHTML = '';
       const placeholder = document.createElement('option');
       placeholder.value = '';
@@ -849,14 +858,15 @@ def home():
         opt.textContent = folder;
         select.appendChild(opt);
       });
-      if(selectedValue){
-        select.value = selectedValue;
-        if(select.value !== selectedValue){
+      const fallbackValue = selectedValue || getStoredFolder() || previousValue;
+      if(fallbackValue){
+        select.value = fallbackValue;
+        if(select.value !== fallbackValue){
           const extra = document.createElement('option');
-          extra.value = selectedValue;
-          extra.textContent = selectedValue;
+          extra.value = fallbackValue;
+          extra.textContent = fallbackValue;
           select.appendChild(extra);
-          select.value = selectedValue;
+          select.value = fallbackValue;
         }
       }
     }
@@ -864,6 +874,9 @@ def home():
     refreshList();
     refreshStatus();
     populateFolderSelect('subfolder');
+    document.getElementById('subfolder').addEventListener('change', (event)=>{
+      setStoredFolder(event.target.value);
+    });
     setInterval(refreshStatus, 1000);
     </script>
     </body></html>
