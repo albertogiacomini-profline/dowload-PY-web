@@ -14,6 +14,17 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## Installazione da zero su container Proxmox (Debian 13)
+
+Usa lo script in `scripts/install_proxmox_debian13.sh`, eseguendolo come root
+nel container e sostituendo `<URL_REPOSITORY>` con l'URL del repository.
+Lo script installa le dipendenze, crea l'ambiente virtuale e registra il servizio
+`downloader-ui.service` per avviare l'app automaticamente.
+
+```bash
+bash scripts/install_proxmox_debian13.sh
+```
+
 ## Avvio
 
 ```bash
