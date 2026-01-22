@@ -3,7 +3,9 @@ import json
 import threading
 import time
 import requests
+import shutil
 import subprocess
+import tempfile
 from queue import Queue, Empty
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template_string
@@ -370,14 +372,31 @@ def api_smb_test():
     if domain and username and "\\" not in username and "@" not in username:
         username = f"{domain}\\{username}"
 
+    if shutil.which("smbclient") is None:
+        return jsonify(
+            {
+                "ok": False,
+                "message": "Errore: smbclient non trovato. Installa il pacchetto samba-client.",
+            }
+        )
+
+    auth_file = None
     try:
         cmd = ["smbclient", f"//{host}/{share}", "-c", "ls", "-p", str(port)]
-        if domain:
-            cmd.extend(["-W", domain])
         if username or password:
-            cmd.extend(["-U", f"{username}%{password}"])
+            with tempfile.NamedTemporaryFile("w", delete=False) as handle:
+                auth_file = handle.name
+                if username:
+                    handle.write(f"username={username}\n")
+                if password:
+                    handle.write(f"password={password}\n")
+                if domain:
+                    handle.write(f"domain={domain}\n")
+            cmd.extend(["-A", auth_file])
         else:
             cmd.append("-N")
+            if domain:
+                cmd.extend(["-W", domain])
 
         result = subprocess.run(
             cmd,
@@ -408,6 +427,12 @@ def api_smb_test():
         return jsonify({"ok": True, "message": message})
     except Exception as exc:
         return jsonify({"ok": False, "message": f"Errore: {exc}"})
+    finally:
+        if auth_file:
+            try:
+                os.unlink(auth_file)
+            except OSError:
+                pass
 
 
 # ------------------------- UI -------------------------
