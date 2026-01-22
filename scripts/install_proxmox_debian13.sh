@@ -15,7 +15,7 @@ mkdir -p "${APP_DIR}"
 cd "${APP_DIR}"
 
 if [ ! -d ".git" ]; then
-  git clone <URL_REPOSITORY> .
+  git clone https://github.com/albertogiacomini-profline/dowload-PY-web .
 fi
 
 python3 -m venv .venv
