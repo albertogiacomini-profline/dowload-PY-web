@@ -898,6 +898,8 @@ def home():
         const input = document.getElementById(inputId);
         input.value = selectedValue;
       }
+      renderSuggestions('subfolder', 'subfolderSuggest');
+      renderSuggestions('editSub', 'editSubSuggest');
     }
 
     bindSuggestionInput('subfolder', 'subfolderSuggest');
