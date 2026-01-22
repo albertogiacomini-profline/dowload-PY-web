@@ -146,7 +146,7 @@ def list_smb_shares(host, username, password):
         conn.close()
 
 
-def list_smb_subfolders(host, username, password, share, max_depth=5):
+def list_smb_subfolders(host, username, password, share, max_depth=2):
     if not share:
         return []
     print(
