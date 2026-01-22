@@ -162,10 +162,22 @@ def list_smb_subfolders(host, username, password, share, max_depth=5):
     try:
         while queue:
             current, depth = queue.pop(0)
+            if current:
+                print(f"[FOLDERS] SMB scan depth={depth} current='{current}'")
             if depth > max_depth:
                 continue
             path = f"/{current}" if current else "/"
-            for entry in conn.listPath(share, path):
+            try:
+                entries = conn.listPath(share, path)
+            except Exception as exc:
+                print(
+                    "[FOLDERS] Errore listPath SMB:",
+                    f"path={path} err={exc}",
+                )
+                continue
+            if current == "":
+                print(f"[FOLDERS] SMB listPath root entries={len(entries)}")
+            for entry in entries:
                 name = entry.filename
                 if name in (".", "..") or name.startswith("."):
                     continue
@@ -176,6 +188,8 @@ def list_smb_subfolders(host, username, password, share, max_depth=5):
                 queue.append((rel, depth + 1))
         unique = sorted(set(folders))
         print(f"[FOLDERS] Trovate {len(unique)} cartelle SMB.")
+        if not unique:
+            print("[FOLDERS] Nessuna cartella SMB trovata.")
         return unique
     except Exception as exc:
         print(f"[FOLDERS] Errore durante la scansione SMB: {exc}")
