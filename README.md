@@ -48,3 +48,19 @@ Esempio:
 ```bash
 DOWNLOADER_BASE_PATH=/mnt/anime DOWNLOADER_DATA_DIR=/var/lib/downloader python app.py
 ```
+
+
+## Hardening operativo
+
+L'app è pensata per uso privato/LAN o dietro Cloudflare Access. Le POST della UI usano
+un token CSRF di sessione e `/api/config` non restituisce più password in chiaro al
+frontend: i campi password vuoti mantengono il valore già configurato.
+
+La secret key Flask viene letta da `DOWNLOADER_SECRET_KEY`; se assente viene generata
+e conservata in `DOWNLOADER_SECRET_KEY_FILE` (default: `DATA_DIR/secret_key`).
+
+Le sottocartelle sono normalizzate come path relativi e non accettano path assoluti o
+segmenti `.`/`..`, per evitare scritture fuori dalla destinazione prevista.
+
+Per installazioni persistenti è preferibile eseguire il servizio con `gunicorn` e un
+utente dedicato non-root, come nello script `scripts/install_proxmox_debian13.sh`.
