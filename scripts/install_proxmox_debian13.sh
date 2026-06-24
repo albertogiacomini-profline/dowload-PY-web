@@ -28,6 +28,17 @@ pip install -r requirements.txt
 
 id -u "${APP_USER}" >/dev/null 2>&1 || useradd --system --home "${DATA_DIR}" --shell /usr/sbin/nologin "${APP_USER}"
 mkdir -p "${DATA_DIR}"
+
+# Migra i dati storici dalle prime installazioni che usavano APP_DIR/data.
+# Non sovrascrive file già presenti in DATA_DIR, così gli upgrade sono sicuri.
+if [ -d "${APP_DIR}/data" ]; then
+  for name in lista.json config.json cleanup.timestamp folders_cache.json; do
+    if [ -f "${APP_DIR}/data/${name}" ] && [ ! -f "${DATA_DIR}/${name}" ]; then
+      cp -a "${APP_DIR}/data/${name}" "${DATA_DIR}/${name}"
+    fi
+  done
+fi
+
 if [ ! -f "${DATA_DIR}/secret_key" ]; then
   openssl rand -base64 48 > "${DATA_DIR}/secret_key"
 fi
