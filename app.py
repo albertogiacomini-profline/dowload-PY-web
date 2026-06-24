@@ -853,7 +853,11 @@ def home():
 
     function escapeHtml(value){
       return String(value || "").replace(/[&<>\"]/g, function(c){
-        return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c];
+        if(c === "&") return "&amp;";
+        if(c === "<") return "&lt;";
+        if(c === ">") return "&gt;";
+        if(c === '"') return "&quot;";
+        return c;
       });
     }
 
