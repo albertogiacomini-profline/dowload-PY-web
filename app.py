@@ -4,14 +4,15 @@ import threading
 import time
 import requests
 import socket
+import secrets
+from pathlib import PurePosixPath
 from queue import Queue, Empty
 from datetime import datetime, timedelta
-from flask import Flask, jsonify, request, render_template_string, redirect, url_for, session
+from flask import Flask, jsonify, request, render_template_string, redirect, url_for, session, abort
 
 from smb.SMBConnection import SMBConnection
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("DOWNLOADER_SECRET_KEY", "change-me")
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DOWNLOADER_DATA_DIR", os.path.join(REPO_ROOT, "data"))
@@ -24,8 +25,37 @@ CLEANUP_FILE = os.environ.get(
 FOLDERS_CACHE_FILE = os.environ.get(
     "DOWNLOADER_FOLDERS_CACHE_FILE", os.path.join(DATA_DIR, "folders_cache.json")
 )
+SECRET_KEY_FILE = os.environ.get(
+    "DOWNLOADER_SECRET_KEY_FILE", os.path.join(DATA_DIR, "secret_key")
+)
 
 os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def load_secret_key():
+    env_secret = os.environ.get("DOWNLOADER_SECRET_KEY")
+    if env_secret:
+        return env_secret
+    try:
+        if os.path.exists(SECRET_KEY_FILE):
+            with open(SECRET_KEY_FILE, "r") as f:
+                secret = f.read().strip()
+            if secret:
+                return secret
+        secret = secrets.token_urlsafe(48)
+        with open(SECRET_KEY_FILE, "w") as f:
+            f.write(secret + "\n")
+        try:
+            os.chmod(SECRET_KEY_FILE, 0o600)
+        except Exception:
+            pass
+        return secret
+    except Exception:
+        # Keep the app running without falling back to a public, fixed secret.
+        return secrets.token_urlsafe(48)
+
+
+app.secret_key = load_secret_key()
 
 download_status = {}
 downloading = False
@@ -66,8 +96,10 @@ def load_json(path, default):
 
 
 def save_json(path, data):
-    with open(path, "w") as f:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp_path, path)
 
 
 def load_config():
@@ -303,6 +335,48 @@ def is_authenticated():
     return bool(session.get("logged_in"))
 
 
+def csrf_token():
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+def validate_csrf():
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return True
+    if request.path == "/login":
+        return True
+    expected = session.get("csrf_token")
+    supplied = request.headers.get("X-CSRFToken") or request.form.get("csrf_token")
+    return bool(expected and supplied and secrets.compare_digest(expected, supplied))
+
+
+def sanitize_subfolder(value):
+    value = (value or "").strip().replace("\\", "/")
+    if not value:
+        return ""
+    path = PurePosixPath(value)
+    if path.is_absolute():
+        raise ValueError("Cartella non valida: path assoluto non consentito.")
+    parts = []
+    for part in path.parts:
+        if part in ("", ".", ".."):
+            raise ValueError("Cartella non valida: segmenti . o .. non consentiti.")
+        parts.append(part)
+    return "/".join(parts)
+
+
+def public_config():
+    payload = dict(config)
+    payload["smb_password"] = ""
+    payload["smb_password_set"] = bool(config.get("smb_password"))
+    payload["login_password"] = ""
+    payload["login_password_set"] = bool(config.get("login_password"))
+    return payload
+
+
 # ------------------------- DOWNLOAD -------------------------
 
 def download_file(url, dest_folder, completed_list):
@@ -410,7 +484,17 @@ def run_downloads(force=False):
 
     for item in data:
         url = item.get("url")
-        subfolder = item.get("subfolder", "")
+        try:
+            subfolder = sanitize_subfolder(item.get("subfolder", ""))
+        except ValueError as exc:
+            with state_lock:
+                download_status[url] = {
+                    "speed": f"Errore: {str(exc)}",
+                    "percent": "-",
+                    "updated_at": time.time(),
+                    "finished_at": time.time(),
+                }
+            continue
         if config.get("smb_share"):
             folder_path = subfolder
         else:
@@ -507,6 +591,8 @@ def require_login():
         return None
     if not is_authenticated():
         return redirect(url_for("login", next=request.path))
+    if not validate_csrf():
+        abort(403)
     return None
 
 
@@ -538,7 +624,11 @@ def api_list():
 def api_add():
     with data_lock:
         data = load_json(DATA_FILE, [])
-    new_item = request.json
+    new_item = request.json or {}
+    try:
+        new_item["subfolder"] = sanitize_subfolder(new_item.get("subfolder", ""))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     new_item["date"] = datetime.now().strftime("%b/%y")
     data.append(new_item)
     with data_lock:
@@ -564,8 +654,11 @@ def api_update():
     with data_lock:
         data = load_json(DATA_FILE, [])
     if 0 <= i < len(data):
+        try:
+            data[i]["subfolder"] = sanitize_subfolder(request.json.get("subfolder"))
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
         data[i]["url"] = request.json.get("url")
-        data[i]["subfolder"] = request.json.get("subfolder")
     with data_lock:
         save_json(DATA_FILE, data)
     return jsonify({"ok": True})
@@ -585,17 +678,19 @@ def api_config():
         config["max_threads"] = body.get("max_threads", config["max_threads"])
         config["smb_host"] = body.get("smb_host", config["smb_host"])
         config["smb_username"] = body.get("smb_username", config["smb_username"])
-        config["smb_password"] = body.get("smb_password", config["smb_password"])
+        if body.get("smb_password"):
+            config["smb_password"] = body.get("smb_password")
         config["smb_share"] = body.get("smb_share", config["smb_share"])
         config["folder_refresh_minutes"] = body.get(
             "folder_refresh_minutes", config["folder_refresh_minutes"]
         )
         config["login_username"] = body.get("login_username", config["login_username"])
-        config["login_password"] = body.get("login_password", config["login_password"])
+        if body.get("login_password"):
+            config["login_password"] = body.get("login_password")
         save_config()
         threading.Thread(target=scan_folders, daemon=True).start()
         return jsonify({"ok": True})
-    return jsonify(config)
+    return jsonify(public_config())
 
 
 @app.route("/api/smb/shares", methods=["POST"])
@@ -754,6 +849,27 @@ def home():
     let editIndex = -1;
     let folderSuggestions = [];
     const MAX_SUGGESTIONS = 8;
+    const CSRF_TOKEN = "{{ csrf_token }}";
+
+    function escapeHtml(value){
+      return String(value || "").replace(/[&<>\"]/g, function(c){
+        if(c === "&") return "&amp;";
+        if(c === "<") return "&lt;";
+        if(c === ">") return "&gt;";
+        if(c === '"') return "&quot;";
+        return c;
+      });
+    }
+
+    function apiFetch(url, options){
+      options = options || {};
+      const headers = Object.assign({}, options.headers || {});
+      if((options.method || "GET").toUpperCase() !== "GET"){
+        headers["X-CSRFToken"] = CSRF_TOKEN;
+      }
+      options.headers = headers;
+      return fetch(url, options);
+    }
 
     function fileNameFromUrl(u){
       try{ return u.split('/').pop(); } catch(e){ return u; }
@@ -794,9 +910,9 @@ def home():
         html += `
           <tr>
             <td>${i}</td>
-            <td>${x.date||''}</td>
-            <td style="word-break:break-all;">${urlDisp}</td>
-            <td>${subDisp}</td>
+            <td>${escapeHtml(x.date||'')}</td>
+            <td style="word-break:break-all;">${escapeHtml(urlDisp)}</td>
+            <td>${escapeHtml(subDisp)}</td>
             <td>
               <span class="btn-row">
                 <button class="btn btn-sm" onclick="edit(${i})">Modifica</button>
@@ -820,7 +936,7 @@ def home():
         for(let k in j.active){
           const v = j.active[k] || {};
           if(v.speed && v.speed.indexOf('404') === -1){
-            txt += "<div>" + fileNameFromUrl(k) + ": " + (v.percent||'-') + " (" + (v.speed||'-') + ")</div>";
+            txt += "<div>" + escapeHtml(fileNameFromUrl(k)) + ": " + escapeHtml(v.percent||'-') + " (" + escapeHtml(v.speed||'-') + ")</div>";
           }
         }
       }
@@ -837,7 +953,7 @@ def home():
       const urls = generateEpisodeUrls(url, episodes);
 
       for(const fullUrl of urls){
-        await fetch('/api/add',{
+        await apiFetch('/api/add',{
           method:'POST',
           headers:{'Content-Type':'application/json'},
           body:JSON.stringify({url:fullUrl, subfolder:sub})
@@ -850,7 +966,7 @@ def home():
     }
 
     async function del(i){
-      await fetch('/api/delete',{
+      await apiFetch('/api/delete',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({index:i})
@@ -873,7 +989,7 @@ def home():
     async function saveEdit(){
       const url = document.getElementById('editUrl').value;
       const sub = document.getElementById('editSub').value;
-      await fetch('/api/update',{
+      await apiFetch('/api/update',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({index:editIndex, url, subfolder:sub})
@@ -882,7 +998,7 @@ def home():
       refreshList();
     }
 
-    async function force(){ await fetch('/api/force',{method:'POST'}); }
+    async function force(){ await apiFetch('/api/force',{method:'POST'}); }
 
     function openConfig(){
       fetch('/api/config').then(r=>r.json()).then(cfg=>{
@@ -890,9 +1006,11 @@ def home():
         document.getElementById('threads').value = cfg.max_threads;
         document.getElementById('smbHost').value = cfg.smb_host || '';
         document.getElementById('smbUser').value = cfg.smb_username || '';
-        document.getElementById('smbPass').value = cfg.smb_password || '';
+        document.getElementById('smbPass').value = '';
+        document.getElementById('smbPass').placeholder = cfg.smb_password_set ? 'Lascia vuoto per mantenere' : 'password';
         document.getElementById('loginUser').value = cfg.login_username || '';
-        document.getElementById('loginPass').value = cfg.login_password || '';
+        document.getElementById('loginPass').value = '';
+        document.getElementById('loginPass').placeholder = cfg.login_password_set ? 'Lascia vuoto per mantenere' : 'password';
         document.getElementById('folderRefresh').value = cfg.folder_refresh_minutes || 30;
         refreshShares(cfg.smb_share || '');
         document.getElementById('configOverlay').style.display = 'flex';
@@ -908,7 +1026,7 @@ def home():
       const loginUser = document.getElementById('loginUser').value.trim();
       const loginPass = document.getElementById('loginPass').value;
       const smbShare = document.getElementById('smbShare').value;
-      await fetch('/api/config',{
+      await apiFetch('/api/config',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({
@@ -932,7 +1050,7 @@ def home():
       const smbHost = document.getElementById('smbHost').value.trim();
       const smbUser = document.getElementById('smbUser').value.trim();
       const smbPass = document.getElementById('smbPass').value;
-      const r = await fetch('/api/smb/shares',{
+      const r = await apiFetch('/api/smb/shares',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({smb_host:smbHost, smb_username:smbUser, smb_password:smbPass})
@@ -1015,7 +1133,7 @@ def home():
     </script>
     </body></html>
     """
-    return render_template_string(html, data=data, base=base_label)
+    return render_template_string(html, data=data, base=base_label, csrf_token=csrf_token())
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -1025,7 +1143,9 @@ def login():
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
         if username == config.get("login_username") and password == config.get("login_password"):
+            session.clear()
             session["logged_in"] = True
+            csrf_token()
             next_url = request.args.get("next") or url_for("home")
             return redirect(next_url)
         error = "Credenziali non valide."
